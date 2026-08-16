@@ -1,0 +1,21 @@
+[os]
+
+name = "RootOS"
+version = "0.32"
+build = "Development Build"
+
+hostname = "RootOS"
+
+language = "es"
+
+
+[user]
+
+default = "user"
+home = "/home/user"
+
+
+[development]
+
+base_system = true
+debug = true
