@@ -1,78 +1,37 @@
 #ifndef ROOTOS_KEYBOARD_H
 #define ROOTOS_KEYBOARD_H
 
-
-typedef enum
-{
-    KEY_NONE,
-
-    KEY_CHARACTER,
-
-    KEY_ENTER,
-    KEY_BACKSPACE,
-    KEY_TAB,
-    KEY_ESCAPE,
-
-    KEY_LEFT,
-    KEY_RIGHT,
-    KEY_UP,
-    KEY_DOWN,
-
-    KEY_HOME,
-    KEY_END,
-
-    KEY_INSERT,
-    KEY_DELETE,
-
-    KEY_PAGE_UP,
-    KEY_PAGE_DOWN,
-
-    KEY_F1,
-    KEY_F2,
-    KEY_F3,
-    KEY_F4,
-    KEY_F5,
-    KEY_F6,
-    KEY_F7,
-    KEY_F8,
-    KEY_F9,
-    KEY_F10,
-    KEY_F11,
-    KEY_F12
-
-} KeyType;
+#include "types.h"
+#include "unicode.h"
+#include "keycodes.h"
 
 
 typedef struct
 {
-    KeyType type;
+    RootKey key;
 
-    /*
-     * Caracter de 8 bits que por ahora
-     * utiliza nuestra terminal VGA.
-     */
-    unsigned char character;
+    RootCodepoint codepoint;
 
-    int shift;
-    int ctrl;
+    bool pressed;
 
-    /*
-     * Alt izquierdo.
-     */
-    int alt;
+    bool shift;
+    bool ctrl;
+    bool alt;
+    bool altgr;
 
-    /*
-     * Alt derecho / AltGr.
-     */
-    int altgr;
+    bool caps_lock;
+    bool num_lock;
 
-    int caps_lock;
-    int num_lock;
-
-} KeyEvent;
+} KeyboardEvent;
 
 
-KeyEvent keyboard_read_event(void);
+void keyboard_reset(void);
+
+
+bool keyboard_feed_byte(
+    u8 scancode,
+    KeyboardEvent* event
+);
 
 
 #endif

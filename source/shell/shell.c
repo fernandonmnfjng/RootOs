@@ -1,25 +1,49 @@
 #include "shell.h"
+
 #include "terminal.h"
-#include "keyboard.h"
+#include "rootinput.h"
+
+#include "unicode.h"
+
 #include "filesystem.h"
+#include "path.h"
+
 #include "io.h"
+
 #include "string.h"
+
 #include "system_config.h"
+
 
 #define COMMAND_BUFFER_SIZE 128
 
-static char command_buffer[COMMAND_BUFFER_SIZE];
+#define COMMAND_UTF8_SIZE \
+    ((COMMAND_BUFFER_SIZE * 4) + 1)
+
+
+static RootCodepoint command_buffer[
+    COMMAND_BUFFER_SIZE
+];
+
+
+static char command_utf8[
+    COMMAND_UTF8_SIZE
+];
+
 
 static u32 command_length = 0;
 
-/* Posicion del cursor dentro del comando */
 static u32 command_cursor = 0;
 
-/* Cantidad de caracteres dibujados */
+
+/*
+ * Celdas visuales, no bytes.
+ */
 static u32 rendered_length = 0;
 
-/* Posicion de pantalla donde empieza el texto del usuario */
+
 static u32 input_start_row = 0;
+
 static u32 input_start_col = 0;
 
 
@@ -77,6 +101,30 @@ static void command_help(void)
 
     terminal_print(
         "shutdown              Apagar QEMU\n"
+    );
+
+    terminal_print(
+        "create --file <ruta>    Crear archivo\n"
+    );
+
+    terminal_print(
+        "create --folder <ruta>  Crear carpeta\n"
+    );
+
+    terminal_print(
+        "remove <ruta>           Eliminar archivo/carpeta\n"
+    );
+
+    terminal_print(
+        "remove -r <ruta>        Eliminar recursivamente\n"
+    );
+
+    terminal_print(
+        "copy <origen> <destino> Copiar\n"
+    );
+
+    terminal_print(
+        "move <origen> <destino> Mover\n"
     );
 }
 
@@ -345,6 +393,485 @@ static void command_shutdown(void)
 }
 
 
+static const char* shell_skip_spaces(
+    const char* text
+)
+{
+    while (
+        *text == ' '
+        ||
+        *text == '\t'
+    )
+    {
+        text++;
+    }
+
+
+    return text;
+}
+
+
+
+static bool shell_read_argument(
+    const char** cursor,
+    char* output,
+    usize output_size
+)
+{
+    const char* text =
+        shell_skip_spaces(
+            *cursor
+        );
+
+
+    if (
+        *text == '\0'
+    )
+    {
+        return false;
+    }
+
+
+    bool quoted =
+        false;
+
+
+    if (
+        *text == '"'
+    )
+    {
+        quoted = true;
+
+        text++;
+    }
+
+
+    usize length = 0;
+
+
+    while (*text)
+    {
+        if (
+            quoted
+        )
+        {
+            if (
+                *text == '"'
+            )
+            {
+                text++;
+
+                break;
+            }
+        }
+
+        else
+        {
+            if (
+                *text == ' '
+                ||
+                *text == '\t'
+            )
+            {
+                break;
+            }
+        }
+
+
+        if (
+            length
+            >=
+            output_size - 1
+        )
+        {
+            return false;
+        }
+
+
+        output[
+            length++
+        ] =
+            *text;
+
+
+        text++;
+    }
+
+
+    output[
+        length
+    ] =
+        '\0';
+
+
+    *cursor =
+        shell_skip_spaces(
+            text
+        );
+
+
+    return
+        length > 0;
+}
+
+static void shell_print_fs_result(
+    FsResult result
+)
+{
+    switch (result)
+    {
+        case FS_RESULT_OK:
+
+            terminal_print(
+                "Done.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_NOT_FOUND:
+
+            terminal_print(
+                "Not found.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_ALREADY_EXISTS:
+
+            terminal_print(
+                "Already exists.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_NOT_DIRECTORY:
+
+            terminal_print(
+                "A path component is not a folder.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_DIRECTORY_NOT_EMPTY:
+
+            terminal_print(
+                "Folder is not empty. Use --recursive.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_INVALID_PATH:
+
+            terminal_print(
+                "Invalid path.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_NO_SPACE:
+
+            terminal_print(
+                "Filesystem node table is full.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_BUSY:
+
+            terminal_print(
+                "Resource is busy or protected.\n"
+            );
+
+            break;
+
+
+        default:
+
+            terminal_print(
+                "Filesystem error.\n"
+            );
+
+            break;
+    }
+}
+
+static void command_create(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char mode[32];
+
+    char path[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            mode,
+            sizeof(mode)
+        )
+        ||
+        !shell_read_argument(
+            &cursor,
+            path,
+            sizeof(path)
+        )
+    )
+    {
+        terminal_print(
+            "Usage:\n"
+            "  create --file <path>\n"
+            "  create --folder <path>\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_streq(
+            mode,
+            "--file"
+        )
+    )
+    {
+        shell_print_fs_result(
+            filesystem_create_file(
+                path
+            )
+        );
+
+        return;
+    }
+
+
+    if (
+        root_streq(
+            mode,
+            "--folder"
+        )
+    )
+    {
+        shell_print_fs_result(
+            filesystem_create_directory(
+                path
+            )
+        );
+
+        return;
+    }
+
+
+    terminal_print(
+        "Unknown create mode.\n"
+    );
+}
+
+static void command_remove(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char first[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            first,
+            sizeof(first)
+        )
+    )
+    {
+        terminal_print(
+            "Usage:\n"
+            "  remove <path>\n"
+            "  remove --recursive <path>\n"
+        );
+
+        return;
+    }
+
+
+    bool recursive =
+        false;
+
+
+    char path[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        root_streq(
+            first,
+            "--recursive"
+        )
+        ||
+        root_streq(
+            first,
+            "-r"
+        )
+    )
+    {
+        recursive =
+            true;
+
+
+        if (
+            !shell_read_argument(
+                &cursor,
+                path,
+                sizeof(path)
+            )
+        )
+        {
+            terminal_print(
+                "Missing path.\n"
+            );
+
+            return;
+        }
+    }
+
+    else
+    {
+        root_strlcpy(
+            path,
+            first,
+            ROOT_PATH_MAX
+        );
+    }
+
+
+    shell_print_fs_result(
+        filesystem_remove(
+            path,
+            recursive
+        )
+    );
+}
+
+static void command_copy(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char source[
+        ROOT_PATH_MAX
+    ];
+
+
+    char destination[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            source,
+            sizeof(source)
+        )
+        ||
+        !shell_read_argument(
+            &cursor,
+            destination,
+            sizeof(destination)
+        )
+    )
+    {
+        terminal_print(
+            "Usage: copy <source> <destination>\n"
+        );
+
+        return;
+    }
+
+
+    shell_print_fs_result(
+        filesystem_copy(
+            source,
+            destination
+        )
+    );
+}
+
+static void command_move(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char source[
+        ROOT_PATH_MAX
+    ];
+
+
+    char destination[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            source,
+            sizeof(source)
+        )
+        ||
+        !shell_read_argument(
+            &cursor,
+            destination,
+            sizeof(destination)
+        )
+    )
+    {
+        terminal_print(
+            "Usage: move <source> <destination>\n"
+        );
+
+        return;
+    }
+
+
+    shell_print_fs_result(
+        filesystem_move(
+            source,
+            destination
+        )
+    );
+}
+
+/*
+ * =====================================
+ * INTERPRETAR COMANDO
+ * =====================================
+ */
+
 /*
  * =====================================
  * INTERPRETAR COMANDO
@@ -356,9 +883,14 @@ static void execute_command(
 )
 {
     /*
-     * ENTER vacío.
+     * ============================================================
+     * EMPTY COMMAND
+     * ============================================================
      */
+
     if (
+        command == NULL
+        ||
         command[0] == '\0'
     )
     {
@@ -367,8 +899,11 @@ static void execute_command(
 
 
     /*
-     * help
+     * ============================================================
+     * HELP
+     * ============================================================
      */
+
     if (
         root_streq(
             command,
@@ -383,8 +918,11 @@ static void execute_command(
 
 
     /*
-     * clear
+     * ============================================================
+     * CLEAR
+     * ============================================================
      */
+
     if (
         root_streq(
             command,
@@ -399,8 +937,11 @@ static void execute_command(
 
 
     /*
-     * about
+     * ============================================================
+     * ABOUT
+     * ============================================================
      */
+
     if (
         root_streq(
             command,
@@ -415,8 +956,11 @@ static void execute_command(
 
 
     /*
-     * echo
+     * ============================================================
+     * ECHO
+     * ============================================================
      */
+
     if (
         root_streq(
             command,
@@ -424,7 +968,9 @@ static void execute_command(
         )
     )
     {
-        terminal_putchar('\n');
+        terminal_putchar(
+            '\n'
+        );
 
         return;
     }
@@ -446,9 +992,9 @@ static void execute_command(
 
 
     /*
-     * =================================
-     * godir
-     * =================================
+     * ============================================================
+     * GODIR
+     * ============================================================
      */
 
     if (
@@ -459,7 +1005,7 @@ static void execute_command(
     )
     {
         terminal_print(
-            "Uso: godir <ruta>\n"
+            "Usage: godir <path>\n"
         );
 
         return;
@@ -482,13 +1028,9 @@ static void execute_command(
 
 
     /*
-     * =================================
-     * seedir("nombre")
-     * =================================
-     *
-     * IMPORTANTE:
-     * esto debe comprobarse antes
-     * del seedir normal.
+     * ============================================================
+     * SEEDIR("NAME")
+     * ============================================================
      */
 
     if (
@@ -507,9 +1049,9 @@ static void execute_command(
 
 
     /*
-     * =================================
-     * seedir
-     * =================================
+     * ============================================================
+     * SEEDIR
+     * ============================================================
      */
 
     if (
@@ -526,9 +1068,9 @@ static void execute_command(
 
 
     /*
-     * =================================
-     * see
-     * =================================
+     * ============================================================
+     * SEE
+     * ============================================================
      */
 
     if (
@@ -538,7 +1080,9 @@ static void execute_command(
         )
     )
     {
-        command_see("");
+        command_see(
+            ""
+        );
 
         return;
     }
@@ -560,8 +1104,160 @@ static void execute_command(
 
 
     /*
-     * reboot
+     * ============================================================
+     * CREATE
+     * ============================================================
      */
+
+    if (
+        root_streq(
+            command,
+            "create"
+        )
+    )
+    {
+        terminal_print(
+            "Usage:\n"
+            "  create --file <path>\n"
+            "  create --folder <path>\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "create "
+        )
+    )
+    {
+        command_create(
+            command + 7
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
+     * REMOVE
+     * ============================================================
+     */
+
+    if (
+        root_streq(
+            command,
+            "remove"
+        )
+    )
+    {
+        terminal_print(
+            "Usage:\n"
+            "  remove <path>\n"
+            "  remove --recursive <path>\n"
+            "  remove -r <path>\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "remove "
+        )
+    )
+    {
+        command_remove(
+            command + 7
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
+     * COPY
+     * ============================================================
+     */
+
+    if (
+        root_streq(
+            command,
+            "copy"
+        )
+    )
+    {
+        terminal_print(
+            "Usage: copy <source> <destination>\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "copy "
+        )
+    )
+    {
+        command_copy(
+            command + 5
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
+     * MOVE
+     * ============================================================
+     */
+
+    if (
+        root_streq(
+            command,
+            "move"
+        )
+    )
+    {
+        terminal_print(
+            "Usage: move <source> <destination>\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "move "
+        )
+    )
+    {
+        command_move(
+            command + 5
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
+     * REBOOT
+     * ============================================================
+     */
+
     if (
         root_streq(
             command,
@@ -576,8 +1272,11 @@ static void execute_command(
 
 
     /*
-     * shutdown
+     * ============================================================
+     * SHUTDOWN
+     * ============================================================
      */
+
     if (
         root_streq(
             command,
@@ -592,15 +1291,22 @@ static void execute_command(
 
 
     /*
-     * Desconocido.
+     * ============================================================
+     * UNKNOWN COMMAND
+     * ============================================================
      */
+
     terminal_print(
-        "Comando desconocido: "
+        "Unknown command: "
     );
 
-    terminal_print(command);
+    terminal_print(
+        command
+    );
 
-    terminal_putchar('\n');
+    terminal_putchar(
+        '\n'
+    );
 }
 
 
@@ -648,20 +1354,80 @@ static void shell_prompt(void)
     rendered_length = 0;
 }
 
+/*
+ * ============================================================
+ * ANCHO VISUAL
+ * ============================================================
+ */
+
+static u32 shell_cells_until(
+    u32 index
+)
+{
+    u32 cells = 0;
+
+
+    if (
+        index > command_length
+    )
+    {
+        index =
+            command_length;
+    }
+
+
+    for (
+        u32 i = 0;
+        i < index;
+        i++
+    )
+    {
+        cells +=
+            terminal_codepoint_cells(
+                command_buffer[i]
+            );
+    }
+
+
+    return cells;
+}
+
+
+static u32 shell_total_cells(void)
+{
+    return
+        shell_cells_until(
+            command_length
+        );
+}
+
+
+/*
+ * ============================================================
+ * CURSOR
+ * ============================================================
+ */
+
 static void shell_update_cursor(void)
 {
     terminal_set_cursor(
-        input_start_col + command_cursor,
+        input_start_col
+        +
+        shell_cells_until(
+            command_cursor
+        ),
+
         input_start_row
     );
 }
 
+
 /*
- * Volver a dibujar la línea completa.
- *
- * Esto permite insertar texto
- * en medio del comando.
+ * ============================================================
+ * REDRAW
+ * ============================================================
  */
+
 static void shell_redraw_line(void)
 {
     terminal_set_cursor(
@@ -670,37 +1436,36 @@ static void shell_redraw_line(void)
     );
 
 
-    /*
-     * Imprimir contenido actual.
-     */
     for (
         u32 i = 0;
         i < command_length;
         i++
     )
     {
-        terminal_putchar(
+        terminal_putcodepoint(
             command_buffer[i]
         );
     }
 
 
-    /*
-     * Borrar caracteres sobrantes
-     * de una versión anterior.
-     */
+    u32 current_cells =
+        shell_total_cells();
+
+
     for (
-        u32 i = command_length;
+        u32 i = current_cells;
         i < rendered_length;
         i++
     )
     {
-        terminal_putchar(' ');
+        terminal_putchar(
+            ' '
+        );
     }
 
 
     rendered_length =
-        command_length;
+        current_cells;
 
 
     shell_update_cursor();
@@ -708,16 +1473,25 @@ static void shell_redraw_line(void)
 
 
 /*
- * Insertar un carácter exactamente
- * donde está el cursor.
+ * ============================================================
+ * INSERTAR UNICODE
+ * ============================================================
  */
-static void shell_insert_character(
-    char c
+
+static void shell_insert_codepoint(
+    RootCodepoint codepoint
 )
 {
-    /*
-     * Dejamos un espacio para \0.
-     */
+    if (
+        !root_unicode_valid(
+            codepoint
+        )
+    )
+    {
+        return;
+    }
+
+
     if (
         command_length
         >=
@@ -728,26 +1502,38 @@ static void shell_insert_character(
     }
 
 
+    u32 needed =
+        terminal_codepoint_cells(
+            codepoint
+        );
+
+
+    u32 total =
+        shell_total_cells();
+
+
+    u32 columns =
+        terminal_get_columns();
+
+
     /*
-     * Esta primera versión del editor
-     * mantiene la entrada en una línea.
+     * Por ahora:
+     * editor de una sola línea.
      */
     if (
         input_start_col
         +
-        command_length
+        total
+        +
+        needed
         >=
-        79
+        columns
     )
     {
         return;
     }
 
 
-    /*
-     * Mover todo una posición
-     * hacia la derecha.
-     */
     for (
         u32 i = command_length;
         i > command_cursor;
@@ -755,13 +1541,16 @@ static void shell_insert_character(
     )
     {
         command_buffer[i] =
-            command_buffer[i - 1];
+            command_buffer[
+                i - 1
+            ];
     }
 
 
     command_buffer[
         command_cursor
-    ] = c;
+    ] =
+        codepoint;
 
 
     command_cursor++;
@@ -771,7 +1560,8 @@ static void shell_insert_character(
 
     command_buffer[
         command_length
-    ] = '\0';
+    ] =
+        0;
 
 
     shell_redraw_line();
@@ -779,8 +1569,11 @@ static void shell_insert_character(
 
 
 /*
- * Backspace.
+ * ============================================================
+ * BACKSPACE
+ * ============================================================
  */
+
 static void shell_backspace(void)
 {
     if (
@@ -795,13 +1588,16 @@ static void shell_backspace(void)
         u32 i =
             command_cursor - 1;
 
-        i < command_length - 1;
+        i <
+            command_length - 1;
 
         i++
     )
     {
         command_buffer[i] =
-            command_buffer[i + 1];
+            command_buffer[
+                i + 1
+            ];
     }
 
 
@@ -812,7 +1608,8 @@ static void shell_backspace(void)
 
     command_buffer[
         command_length
-    ] = '\0';
+    ] =
+        0;
 
 
     shell_redraw_line();
@@ -820,8 +1617,11 @@ static void shell_backspace(void)
 
 
 /*
- * Delete.
+ * ============================================================
+ * DELETE
+ * ============================================================
  */
+
 static void shell_delete(void)
 {
     if (
@@ -835,15 +1635,19 @@ static void shell_delete(void)
 
 
     for (
-        u32 i = command_cursor;
+        u32 i =
+            command_cursor;
 
-        i < command_length - 1;
+        i <
+            command_length - 1;
 
         i++
     )
     {
         command_buffer[i] =
-            command_buffer[i + 1];
+            command_buffer[
+                i + 1
+            ];
     }
 
 
@@ -852,7 +1656,8 @@ static void shell_delete(void)
 
     command_buffer[
         command_length
-    ] = '\0';
+    ] =
+        0;
 
 
     shell_redraw_line();
@@ -860,20 +1665,201 @@ static void shell_delete(void)
 
 
 /*
- * Borrar comando actual completo.
+ * ============================================================
+ * CLEAR INPUT
+ * ============================================================
  */
+
 static void shell_clear_input(void)
 {
     command_length = 0;
 
     command_cursor = 0;
 
-    command_buffer[0] =
-        '\0';
+    command_buffer[0] = 0;
 
 
     shell_redraw_line();
 }
+
+
+/*
+ * ============================================================
+ * UNICODE -> UTF-8 PARA LOS COMANDOS
+ * ============================================================
+ */
+
+static bool shell_build_utf8(void)
+{
+    usize output = 0;
+
+
+    for (
+        u32 i = 0;
+        i < command_length;
+        i++
+    )
+    {
+        char encoded[4];
+
+
+        usize count =
+            root_utf8_encode(
+                command_buffer[i],
+                encoded
+            );
+
+
+        if (
+            output
+            +
+            count
+            >=
+            COMMAND_UTF8_SIZE
+        )
+        {
+            return false;
+        }
+
+
+        for (
+            usize j = 0;
+            j < count;
+            j++
+        )
+        {
+            command_utf8[
+                output++
+            ] =
+                encoded[j];
+        }
+    }
+
+
+    command_utf8[
+        output
+    ] =
+        '\0';
+
+
+    return true;
+}
+
+
+/*
+ * ============================================================
+ * MOUSE -> CURSOR DE TEXTO
+ * ============================================================
+ */
+
+static void shell_mouse_click(
+    const RootInputEvent* event
+)
+{
+    if (
+        event->button
+        !=
+        ROOT_MOUSE_LEFT
+    )
+    {
+        return;
+    }
+
+
+    u32 column;
+    u32 row;
+
+
+    if (
+        !terminal_pixel_to_cell(
+            event->mouse_x,
+            event->mouse_y,
+            &column,
+            &row
+        )
+    )
+    {
+        return;
+    }
+
+
+    if (
+        row
+        !=
+        input_start_row
+    )
+    {
+        return;
+    }
+
+
+    if (
+        column
+        <
+        input_start_col
+    )
+    {
+        return;
+    }
+
+
+    u32 target =
+        column
+        -
+        input_start_col;
+
+
+    u32 position = 0;
+
+    u32 cells = 0;
+
+
+    while (
+        position
+        <
+        command_length
+    )
+    {
+        u32 width =
+            terminal_codepoint_cells(
+                command_buffer[
+                    position
+                ]
+            );
+
+
+        if (
+            target
+            <
+            cells
+            +
+            width
+        )
+        {
+            break;
+        }
+
+
+        cells +=
+            width;
+
+        position++;
+    }
+
+
+    command_cursor =
+        position;
+
+
+    shell_update_cursor();
+}
+
+
+/*
+ * ============================================================
+ * SHELL LOOP
+ * ============================================================
+ */
 
 void shell_run(void)
 {
@@ -883,39 +1869,67 @@ void shell_run(void)
 
     rendered_length = 0;
 
-    command_buffer[0] =
-        '\0';
+    command_buffer[0] = 0;
+
 
     shell_prompt();
 
 
     while (1)
     {
-        KeyEvent event =
-            keyboard_read_event();
+        RootInputEvent event =
+            rootinput_wait_event();
 
 
         /*
-         * =================================
-         * CTRL
-         * =================================
+         * ========================================
+         * MOUSE
+         * ========================================
          */
 
         if (
-            event.type == KEY_CHARACTER
-            &&
-            event.ctrl
+            event.type
+            ==
+            ROOT_INPUT_MOUSE_CLICK
         )
         {
+            shell_mouse_click(
+                &event
+            );
+
+            continue;
+        }
+
+
+        /*
+         * Solo KEY DOWN afecta
+         * actualmente a la shell.
+         */
+        if (
+            event.type
+            !=
+            ROOT_INPUT_KEY_DOWN
+        )
+        {
+            continue;
+        }
+
+
+        /*
+         * ========================================
+         * CTRL SHORTCUTS
+         * ========================================
+         */
+
+        if (event.ctrl)
+        {
             /*
-             * CTRL + A
-             *
-             * Inicio de linea.
+             * Ctrl+A
              */
             if (
-                event.character == 'a'
-                ||
-                event.character == 'A'
+                event.key
+                ==
+                ROOT_KEY_A
             )
             {
                 command_cursor = 0;
@@ -927,14 +1941,12 @@ void shell_run(void)
 
 
             /*
-             * CTRL + E
-             *
-             * Final de linea.
+             * Ctrl+E
              */
             if (
-                event.character == 'e'
-                ||
-                event.character == 'E'
+                event.key
+                ==
+                ROOT_KEY_E
             )
             {
                 command_cursor =
@@ -947,14 +1959,12 @@ void shell_run(void)
 
 
             /*
-             * CTRL + U
-             *
-             * Borrar linea.
+             * Ctrl+U
              */
             if (
-                event.character == 'u'
-                ||
-                event.character == 'U'
+                event.key
+                ==
+                ROOT_KEY_U
             )
             {
                 shell_clear_input();
@@ -964,24 +1974,18 @@ void shell_run(void)
 
 
             /*
-             * CTRL + L
-             *
-             * Limpiar pantalla.
+             * Ctrl+L
              */
             if (
-                event.character == 'l'
-                ||
-                event.character == 'L'
+                event.key
+                ==
+                ROOT_KEY_L
             )
             {
                 terminal_clear();
 
                 shell_prompt();
 
-                /*
-                 * Volver a mostrar lo
-                 * que estaba escrito.
-                 */
                 shell_redraw_line();
 
                 continue;
@@ -989,17 +1993,18 @@ void shell_run(void)
 
 
             /*
-             * CTRL + C
-             *
-             * Cancelar linea actual.
+             * Ctrl+C
              */
             if (
-                event.character == 'c'
-                ||
-                event.character == 'C'
+                event.key
+                ==
+                ROOT_KEY_C
             )
             {
-                terminal_print("^C\n");
+                terminal_print(
+                    "^C\n"
+                );
+
 
                 command_length = 0;
 
@@ -1007,8 +2012,8 @@ void shell_run(void)
 
                 rendered_length = 0;
 
-                command_buffer[0] =
-                    '\0';
+                command_buffer[0] = 0;
+
 
                 shell_prompt();
 
@@ -1018,61 +2023,52 @@ void shell_run(void)
 
 
         /*
-         * =================================
+         * ========================================
          * ENTER
-         * =================================
+         * ========================================
          */
 
         if (
-            event.type == KEY_ENTER
+            event.key
+            ==
+            ROOT_KEY_ENTER
+            ||
+            event.key
+            ==
+            ROOT_KEY_KP_ENTER
         )
         {
-            /*
-             * Cursor al final antes
-             * de cambiar de linea.
-             */
             command_cursor =
                 command_length;
 
+
             shell_update_cursor();
 
-            terminal_putchar('\n');
 
-
-            /*
-             * Final del string.
-             */
-            command_buffer[
-                command_length
-            ] = '\0';
-
-
-            /*
-             * Ejecutar comando.
-             *
-             * Esta funcion ya la tenias.
-             */
-            execute_command(
-                command_buffer
+            terminal_putchar(
+                '\n'
             );
 
 
-            /*
-             * Limpiar entrada.
-             */
+            if (
+                shell_build_utf8()
+            )
+            {
+                execute_command(
+                    command_utf8
+                );
+            }
+
+
             command_length = 0;
 
             command_cursor = 0;
 
             rendered_length = 0;
 
-            command_buffer[0] =
-                '\0';
+            command_buffer[0] = 0;
 
 
-            /*
-             * Nuevo prompt.
-             */
             shell_prompt();
 
             continue;
@@ -1080,13 +2076,15 @@ void shell_run(void)
 
 
         /*
-         * =================================
-         * FLECHA IZQUIERDA
-         * =================================
+         * ========================================
+         * MOVIMIENTO
+         * ========================================
          */
 
         if (
-            event.type == KEY_LEFT
+            event.key
+            ==
+            ROOT_KEY_LEFT
         )
         {
             if (
@@ -1098,18 +2096,15 @@ void shell_run(void)
                 shell_update_cursor();
             }
 
+
             continue;
         }
 
 
-        /*
-         * =================================
-         * FLECHA DERECHA
-         * =================================
-         */
-
         if (
-            event.type == KEY_RIGHT
+            event.key
+            ==
+            ROOT_KEY_RIGHT
         )
         {
             if (
@@ -1123,18 +2118,15 @@ void shell_run(void)
                 shell_update_cursor();
             }
 
+
             continue;
         }
 
 
-        /*
-         * =================================
-         * HOME
-         * =================================
-         */
-
         if (
-            event.type == KEY_HOME
+            event.key
+            ==
+            ROOT_KEY_HOME
         )
         {
             command_cursor = 0;
@@ -1145,14 +2137,10 @@ void shell_run(void)
         }
 
 
-        /*
-         * =================================
-         * END
-         * =================================
-         */
-
         if (
-            event.type == KEY_END
+            event.key
+            ==
+            ROOT_KEY_END
         )
         {
             command_cursor =
@@ -1165,15 +2153,15 @@ void shell_run(void)
 
 
         /*
-         * =================================
-         * BACKSPACE
-         * =================================
+         * ========================================
+         * BORRAR
+         * ========================================
          */
 
         if (
-            event.type
+            event.key
             ==
-            KEY_BACKSPACE
+            ROOT_KEY_BACKSPACE
         )
         {
             shell_backspace();
@@ -1182,16 +2170,10 @@ void shell_run(void)
         }
 
 
-        /*
-         * =================================
-         * DELETE
-         * =================================
-         */
-
         if (
-            event.type
+            event.key
             ==
-            KEY_DELETE
+            ROOT_KEY_DELETE
         )
         {
             shell_delete();
@@ -1201,19 +2183,19 @@ void shell_run(void)
 
 
         /*
-         * =================================
-         * CARACTER NORMAL
-         * =================================
+         * ========================================
+         * TEXTO UNICODE
+         * ========================================
          */
 
         if (
-            event.type
-            ==
-            KEY_CHARACTER
+            event.codepoint
+            !=
+            0
         )
         {
-            shell_insert_character(
-                event.character
+            shell_insert_codepoint(
+                event.codepoint
             );
 
             continue;

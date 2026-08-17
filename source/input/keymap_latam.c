@@ -1,77 +1,14 @@
 #include "keymap_latam.h"
 
 
-/*
- * ==========================================
- * CODIGOS DE LA FUENTE VGA ACTUAL (CP437)
- * ==========================================
- *
- * Esto es temporal.
- *
- * Cuando RootOS tenga framebuffer + fuente
- * propia cambiaremos todo a Unicode/UTF-8.
- */
-
-#define CHAR_C_CEDILLA       0x87
-#define CHAR_C_CEDILLA_UPPER 0x80
-
-#define CHAR_U_DIAERESIS     0x81
-#define CHAR_E_ACUTE         0x82
-#define CHAR_A_CIRCUMFLEX    0x83
-#define CHAR_A_DIAERESIS     0x84
-#define CHAR_A_GRAVE         0x85
-
-#define CHAR_E_CIRCUMFLEX    0x88
-#define CHAR_E_DIAERESIS     0x89
-#define CHAR_E_GRAVE         0x8A
-#define CHAR_I_DIAERESIS     0x8B
-#define CHAR_I_CIRCUMFLEX    0x8C
-#define CHAR_I_GRAVE         0x8D
-
-#define CHAR_A_DIAERESIS_UPPER 0x8E
-#define CHAR_E_ACUTE_UPPER     0x90
-
-#define CHAR_O_CIRCUMFLEX    0x93
-#define CHAR_O_DIAERESIS     0x94
-#define CHAR_O_GRAVE         0x95
-#define CHAR_U_CIRCUMFLEX    0x96
-#define CHAR_U_GRAVE         0x97
-
-#define CHAR_O_DIAERESIS_UPPER 0x99
-#define CHAR_U_DIAERESIS_UPPER 0x9A
-
-#define CHAR_A_ACUTE         0xA0
-#define CHAR_I_ACUTE         0xA1
-#define CHAR_O_ACUTE         0xA2
-#define CHAR_U_ACUTE         0xA3
-
-#define CHAR_N_TILDE         0xA4
-#define CHAR_N_TILDE_UPPER   0xA5
-
-#define CHAR_QUESTION_DOWN   0xA8
-#define CHAR_NOT             0xAA
-#define CHAR_HALF            0xAB
-#define CHAR_EXCLAM_DOWN     0xAD
-
-#define CHAR_DEGREE          0xF8
-#define CHAR_MIDDLE_DOT      0xFA
-
-
-/*
- * ==========================================
- * DEAD KEYS
- * ==========================================
- */
-
 typedef enum
 {
-    DEAD_NONE,
+    DEAD_NONE = 0,
 
     DEAD_ACUTE,
     DEAD_DIAERESIS,
     DEAD_CIRCUMFLEX,
-    DEAD_GRAVE,
-    DEAD_CEDILLA
+    DEAD_GRAVE
 
 } DeadKey;
 
@@ -81,97 +18,102 @@ static DeadKey dead_key =
 
 
 /*
- * ==========================================
+ * ============================================================
  * LETRAS
- * ==========================================
+ * ============================================================
  */
 
-static u8 letter_from_scancode(
-    u8 scancode
+static RootCodepoint key_letter(
+    RootKey key
 )
 {
-    switch (scancode)
+    switch (key)
     {
-        case 0x10: return 'q';
-        case 0x11: return 'w';
-        case 0x12: return 'e';
-        case 0x13: return 'r';
-        case 0x14: return 't';
-        case 0x15: return 'y';
-        case 0x16: return 'u';
-        case 0x17: return 'i';
-        case 0x18: return 'o';
-        case 0x19: return 'p';
+        case ROOT_KEY_A: return 'a';
+        case ROOT_KEY_B: return 'b';
+        case ROOT_KEY_C: return 'c';
+        case ROOT_KEY_D: return 'd';
+        case ROOT_KEY_E: return 'e';
+        case ROOT_KEY_F: return 'f';
+        case ROOT_KEY_G: return 'g';
+        case ROOT_KEY_H: return 'h';
+        case ROOT_KEY_I: return 'i';
+        case ROOT_KEY_J: return 'j';
+        case ROOT_KEY_K: return 'k';
+        case ROOT_KEY_L: return 'l';
+        case ROOT_KEY_M: return 'm';
+        case ROOT_KEY_N: return 'n';
+        case ROOT_KEY_O: return 'o';
+        case ROOT_KEY_P: return 'p';
+        case ROOT_KEY_Q: return 'q';
+        case ROOT_KEY_R: return 'r';
+        case ROOT_KEY_S: return 's';
+        case ROOT_KEY_T: return 't';
+        case ROOT_KEY_U: return 'u';
+        case ROOT_KEY_V: return 'v';
+        case ROOT_KEY_W: return 'w';
+        case ROOT_KEY_X: return 'x';
+        case ROOT_KEY_Y: return 'y';
+        case ROOT_KEY_Z: return 'z';
 
-        case 0x1E: return 'a';
-        case 0x1F: return 's';
-        case 0x20: return 'd';
-        case 0x21: return 'f';
-        case 0x22: return 'g';
-        case 0x23: return 'h';
-        case 0x24: return 'j';
-        case 0x25: return 'k';
-        case 0x26: return 'l';
-
-        case 0x2C: return 'z';
-        case 0x2D: return 'x';
-        case 0x2E: return 'c';
-        case 0x2F: return 'v';
-        case 0x30: return 'b';
-        case 0x31: return 'n';
-        case 0x32: return 'm';
+        default:
+            return 0;
     }
-
-    return 0;
 }
 
 
-static int is_lowercase_letter(
-    u8 c
+static RootCodepoint upper(
+    RootCodepoint c
 )
 {
-    return (
+    if (
         c >= 'a'
         &&
         c <= 'z'
-    );
+    )
+    {
+        return
+            c
+            -
+            'a'
+            +
+            'A';
+    }
+
+
+    return c;
 }
 
 
 /*
- * ==========================================
- * COMPOSICION DE ACENTOS
- * ==========================================
+ * ============================================================
+ * DEAD KEYS
+ * ============================================================
  */
 
-static u8 compose_dead_key(
-    u8 character
+static RootCodepoint compose(
+    RootCodepoint character
 )
 {
-    DeadKey old_dead =
+    DeadKey previous =
         dead_key;
+
 
     dead_key =
         DEAD_NONE;
 
 
-    /*
-     * Dead key + espacio:
-     *
-     * Como VGA actual no tiene todos los
-     * signos Unicode independientes,
-     * usamos equivalentes ASCII.
-     */
-
-    if (character == ' ')
+    if (
+        character == ' '
+    )
     {
-        switch (old_dead)
+        switch (previous)
         {
             case DEAD_ACUTE:
-                return '\'';
+                return 0x00B4; /* ´ */
 
             case DEAD_DIAERESIS:
-                return '"';
+                return 0x00A8; /* ¨ */
 
             case DEAD_CIRCUMFLEX:
                 return '^';
@@ -179,201 +121,186 @@ static u8 compose_dead_key(
             case DEAD_GRAVE:
                 return '`';
 
-            case DEAD_CEDILLA:
-                return ',';
-
             default:
                 return ' ';
         }
     }
 
 
-    /*
-     * ACENTO AGUDO
-     */
-
-    if (old_dead == DEAD_ACUTE)
+    if (
+        previous == DEAD_ACUTE
+    )
     {
         switch (character)
         {
-            case 'a': return CHAR_A_ACUTE;
-            case 'e': return CHAR_E_ACUTE;
-            case 'i': return CHAR_I_ACUTE;
-            case 'o': return CHAR_O_ACUTE;
-            case 'u': return CHAR_U_ACUTE;
+            case 'a': return 0x00E1;
+            case 'e': return 0x00E9;
+            case 'i': return 0x00ED;
+            case 'o': return 0x00F3;
+            case 'u': return 0x00FA;
 
-            case 'E': return CHAR_E_ACUTE_UPPER;
+            case 'A': return 0x00C1;
+            case 'E': return 0x00C9;
+            case 'I': return 0x00CD;
+            case 'O': return 0x00D3;
+            case 'U': return 0x00DA;
         }
     }
 
 
-    /*
-     * DIERESIS
-     */
-
-    if (old_dead == DEAD_DIAERESIS)
+    if (
+        previous == DEAD_DIAERESIS
+    )
     {
         switch (character)
         {
-            case 'a': return CHAR_A_DIAERESIS;
-            case 'e': return CHAR_E_DIAERESIS;
-            case 'i': return CHAR_I_DIAERESIS;
-            case 'o': return CHAR_O_DIAERESIS;
-            case 'u': return CHAR_U_DIAERESIS;
+            case 'a': return 0x00E4;
+            case 'e': return 0x00EB;
+            case 'i': return 0x00EF;
+            case 'o': return 0x00F6;
+            case 'u': return 0x00FC;
 
-            case 'A': return CHAR_A_DIAERESIS_UPPER;
-            case 'O': return CHAR_O_DIAERESIS_UPPER;
-            case 'U': return CHAR_U_DIAERESIS_UPPER;
+            case 'A': return 0x00C4;
+            case 'E': return 0x00CB;
+            case 'I': return 0x00CF;
+            case 'O': return 0x00D6;
+            case 'U': return 0x00DC;
         }
     }
 
 
-    /*
-     * CIRCUNFLEJO
-     */
-
-    if (old_dead == DEAD_CIRCUMFLEX)
+    if (
+        previous == DEAD_CIRCUMFLEX
+    )
     {
         switch (character)
         {
-            case 'a': return CHAR_A_CIRCUMFLEX;
-            case 'e': return CHAR_E_CIRCUMFLEX;
-            case 'i': return CHAR_I_CIRCUMFLEX;
-            case 'o': return CHAR_O_CIRCUMFLEX;
-            case 'u': return CHAR_U_CIRCUMFLEX;
+            case 'a': return 0x00E2;
+            case 'e': return 0x00EA;
+            case 'i': return 0x00EE;
+            case 'o': return 0x00F4;
+            case 'u': return 0x00FB;
+
+            case 'A': return 0x00C2;
+            case 'E': return 0x00CA;
+            case 'I': return 0x00CE;
+            case 'O': return 0x00D4;
+            case 'U': return 0x00DB;
         }
     }
 
 
-    /*
-     * ACENTO GRAVE
-     */
-
-    if (old_dead == DEAD_GRAVE)
+    if (
+        previous == DEAD_GRAVE
+    )
     {
         switch (character)
         {
-            case 'a': return CHAR_A_GRAVE;
-            case 'e': return CHAR_E_GRAVE;
-            case 'i': return CHAR_I_GRAVE;
-            case 'o': return CHAR_O_GRAVE;
-            case 'u': return CHAR_U_GRAVE;
+            case 'a': return 0x00E0;
+            case 'e': return 0x00E8;
+            case 'i': return 0x00EC;
+            case 'o': return 0x00F2;
+            case 'u': return 0x00F9;
+
+            case 'A': return 0x00C0;
+            case 'E': return 0x00C8;
+            case 'I': return 0x00CC;
+            case 'O': return 0x00D2;
+            case 'U': return 0x00D9;
         }
     }
 
 
-    /*
-     * CEDILLA
-     */
-
-    if (old_dead == DEAD_CEDILLA)
-    {
-        if (character == 'c')
-        {
-            return CHAR_C_CEDILLA;
-        }
-
-        if (character == 'C')
-        {
-            return CHAR_C_CEDILLA_UPPER;
-        }
-    }
-
-
-    /*
-     * No existia combinacion.
-     */
     return character;
 }
 
 
-static u8 finish_character(
-    u8 character
+static RootCodepoint finish(
+    RootCodepoint character
 )
 {
     if (
         dead_key != DEAD_NONE
     )
     {
-        return compose_dead_key(
+        return compose(
             character
         );
     }
+
 
     return character;
 }
 
 
 /*
- * ==========================================
- * KEYMAP LATINOAMERICANO
- * ==========================================
+ * ============================================================
+ * KEYMAP
+ * ============================================================
  */
 
-u8 keymap_latam_translate(
-    u8 scancode,
-    int shift,
-    int altgr,
-    int caps_lock,
-    int num_lock
+RootCodepoint keymap_latam_translate(
+    RootKey key,
+    bool shift,
+    bool altgr,
+    bool caps_lock,
+    bool num_lock
 )
 {
     /*
-     * Primero letras QWERTY.
+     * Euro.
      */
+    if (
+        key == ROOT_KEY_E
+        &&
+        altgr
+    )
+    {
+        return 0x20AC;
+    }
 
-    u8 letter =
-        letter_from_scancode(
-            scancode
+
+    /*
+     * Letras.
+     */
+    RootCodepoint letter =
+        key_letter(
+            key
         );
 
 
     if (letter)
     {
-        int uppercase =
+        if (
             shift
             ^
-            caps_lock;
-
-
-        if (
-            uppercase
-            &&
-            is_lowercase_letter(letter)
+            caps_lock
         )
         {
             letter =
-                letter
-                -
-                'a'
-                +
-                'A';
+                upper(
+                    letter
+                );
         }
 
 
-        return finish_character(
+        return finish(
             letter
         );
     }
 
 
-    /*
-     * ======================================
-     * FILA DE NUMEROS
-     * ======================================
-     */
-
-    switch (scancode)
+    switch (key)
     {
         /*
          * 1 ! |
          */
-        case 0x02:
+        case ROOT_KEY_1:
 
             if (altgr)
-                return finish_character('|');
+                return finish('|');
 
-            return finish_character(
+            return finish(
                 shift ? '!' : '1'
             );
 
@@ -381,12 +308,12 @@ u8 keymap_latam_translate(
         /*
          * 2 " @
          */
-        case 0x03:
+        case ROOT_KEY_2:
 
             if (altgr)
-                return finish_character('@');
+                return finish('@');
 
-            return finish_character(
+            return finish(
                 shift ? '"' : '2'
             );
 
@@ -394,14 +321,12 @@ u8 keymap_latam_translate(
         /*
          * 3 # ·
          */
-        case 0x04:
+        case ROOT_KEY_3:
 
             if (altgr)
-                return finish_character(
-                    CHAR_MIDDLE_DOT
-                );
+                return finish(0x00B7);
 
-            return finish_character(
+            return finish(
                 shift ? '#' : '3'
             );
 
@@ -409,27 +334,19 @@ u8 keymap_latam_translate(
         /*
          * 4 $ ~
          */
-        case 0x05:
+        case ROOT_KEY_4:
 
             if (altgr)
-                return finish_character('~');
+                return finish('~');
 
-            return finish_character(
+            return finish(
                 shift ? '$' : '4'
             );
 
 
-        /*
-         * 5 % ½
-         */
-        case 0x06:
+        case ROOT_KEY_5:
 
-            if (altgr)
-                return finish_character(
-                    CHAR_HALF
-                );
-
-            return finish_character(
+            return finish(
                 shift ? '%' : '5'
             );
 
@@ -437,14 +354,12 @@ u8 keymap_latam_translate(
         /*
          * 6 & ¬
          */
-        case 0x07:
+        case ROOT_KEY_6:
 
             if (altgr)
-                return finish_character(
-                    CHAR_NOT
-                );
+                return finish(0x00AC);
 
-            return finish_character(
+            return finish(
                 shift ? '&' : '6'
             );
 
@@ -452,12 +367,12 @@ u8 keymap_latam_translate(
         /*
          * 7 / {
          */
-        case 0x08:
+        case ROOT_KEY_7:
 
             if (altgr)
-                return finish_character('{');
+                return finish('{');
 
-            return finish_character(
+            return finish(
                 shift ? '/' : '7'
             );
 
@@ -465,12 +380,12 @@ u8 keymap_latam_translate(
         /*
          * 8 ( [
          */
-        case 0x09:
+        case ROOT_KEY_8:
 
             if (altgr)
-                return finish_character('[');
+                return finish('[');
 
-            return finish_character(
+            return finish(
                 shift ? '(' : '8'
             );
 
@@ -478,12 +393,12 @@ u8 keymap_latam_translate(
         /*
          * 9 ) ]
          */
-        case 0x0A:
+        case ROOT_KEY_9:
 
             if (altgr)
-                return finish_character(']');
+                return finish(']');
 
-            return finish_character(
+            return finish(
                 shift ? ')' : '9'
             );
 
@@ -491,264 +406,223 @@ u8 keymap_latam_translate(
         /*
          * 0 = }
          */
-        case 0x0B:
+        case ROOT_KEY_0:
 
             if (altgr)
-                return finish_character('}');
+                return finish('}');
 
-            return finish_character(
+            return finish(
                 shift ? '=' : '0'
             );
 
 
         /*
+         * Tecla física -.
+         *
          * ' ? \
          */
-        case 0x0C:
+        case ROOT_KEY_MINUS:
 
             if (altgr)
-                return finish_character('\\');
+                return finish('\\');
 
-            return finish_character(
+            return finish(
                 shift ? '?' : '\''
             );
 
 
         /*
          * ¿ ¡
-         *
-         * AltGr: cedilla como dead key.
          */
-        case 0x0D:
+        case ROOT_KEY_EQUAL:
+
+            return finish(
+                shift
+                ?
+                0x00A1
+                :
+                0x00BF
+            );
+
+
+        /*
+         * Dead key:
+         *
+         * ´ / ¨
+         */
+        case ROOT_KEY_LEFT_BRACKET:
 
             if (altgr)
             {
                 dead_key =
-                    DEAD_CEDILLA;
+                    DEAD_GRAVE;
+            }
+
+            else if (shift)
+            {
+                dead_key =
+                    DEAD_DIAERESIS;
+            }
+
+            else
+            {
+                dead_key =
+                    DEAD_ACUTE;
+            }
+
+            return 0;
+
+
+        /*
+         * + * ~
+         */
+        case ROOT_KEY_RIGHT_BRACKET:
+
+            if (altgr)
+                return finish('~');
+
+            return finish(
+                shift ? '*' : '+'
+            );
+
+
+        /*
+         * Ñ.
+         *
+         * Esta es la posición física
+         * del ; en un teclado US.
+         */
+        case ROOT_KEY_SEMICOLON:
+
+            return finish(
+                shift
+                ?
+                0x00D1
+                :
+                0x00F1
+            );
+
+
+        /*
+         * { [ ^
+         */
+        case ROOT_KEY_APOSTROPHE:
+
+            if (altgr)
+            {
+                dead_key =
+                    DEAD_CIRCUMFLEX;
 
                 return 0;
             }
 
-            return finish_character(
+            return finish(
+                shift ? '[' : '{'
+            );
+
+
+        /*
+         * | ° ¬
+         */
+        case ROOT_KEY_GRAVE:
+
+            if (altgr)
+                return finish(0x00AC);
+
+            return finish(
                 shift
                 ?
-                CHAR_EXCLAM_DOWN
+                0x00B0
                 :
-                CHAR_QUESTION_DOWN
-            );
-    }
-
-
-    /*
-     * ======================================
-     * TECLAS DESPUES DE P
-     * ======================================
-     */
-
-    /*
-     * ´ / ¨
-     */
-    if (scancode == 0x1A)
-    {
-        if (shift || altgr)
-        {
-            dead_key =
-                DEAD_DIAERESIS;
-        }
-
-        else
-        {
-            dead_key =
-                DEAD_ACUTE;
-        }
-
-        return 0;
-    }
-
-
-    /*
-     * + * ~
-     */
-    if (scancode == 0x1B)
-    {
-        if (altgr)
-            return finish_character('~');
-
-        return finish_character(
-            shift ? '*' : '+'
-        );
-    }
-
-
-    /*
-     * ======================================
-     * Ñ
-     * ======================================
-     */
-
-    if (scancode == 0x27)
-    {
-        if (altgr)
-            return finish_character('~');
-
-        return finish_character(
-            shift
-            ?
-            CHAR_N_TILDE_UPPER
-            :
-            CHAR_N_TILDE
-        );
-    }
-
-
-    /*
-     * { [ ^
-     */
-    if (scancode == 0x28)
-    {
-        if (altgr)
-            return finish_character('^');
-
-        return finish_character(
-            shift ? '[' : '{'
-        );
-    }
-
-
-    /*
-     * | ° ¬
-     *
-     * Tecla a la izquierda del 1
-     * en teclado ISO/LatAm.
-     */
-    if (scancode == 0x29)
-    {
-        if (altgr)
-            return finish_character(
-                CHAR_NOT
+                '|'
             );
 
-        if (shift)
-            return finish_character(
-                CHAR_DEGREE
+
+        /*
+         * } ] `
+         */
+        case ROOT_KEY_BACKSLASH:
+
+            if (altgr)
+                return finish('`');
+
+            return finish(
+                shift ? ']' : '}'
             );
 
-        return finish_character('|');
+
+        case ROOT_KEY_ISO_LTGT:
+
+            if (altgr)
+                return finish('|');
+
+            return finish(
+                shift ? '>' : '<'
+            );
+
+
+        case ROOT_KEY_COMMA:
+
+            return finish(
+                shift ? ';' : ','
+            );
+
+
+        case ROOT_KEY_DOT:
+
+            return finish(
+                shift ? ':' : '.'
+            );
+
+
+        case ROOT_KEY_SLASH:
+
+            return finish(
+                shift ? '_' : '-'
+            );
+
+
+        case ROOT_KEY_SPACE:
+
+            return finish(' ');
+
+
+        case ROOT_KEY_KP_MULTIPLY:
+            return '*';
+
+        case ROOT_KEY_KP_DIVIDE:
+            return '/';
+
+        case ROOT_KEY_KP_PLUS:
+            return '+';
+
+        case ROOT_KEY_KP_MINUS:
+            return '-';
+
+
+        default:
+            break;
     }
-
-
-    /*
-     * } ] `
-     */
-    if (scancode == 0x2B)
-    {
-        if (altgr)
-            return finish_character('`');
-
-        return finish_character(
-            shift ? ']' : '}'
-        );
-    }
-
-
-    /*
-     * ======================================
-     * PARTE INFERIOR
-     * ======================================
-     */
-
-    /*
-     * , ;
-     */
-    if (scancode == 0x33)
-    {
-        return finish_character(
-            shift ? ';' : ','
-        );
-    }
-
-
-    /*
-     * . :
-     */
-    if (scancode == 0x34)
-    {
-        return finish_character(
-            shift ? ':' : '.'
-        );
-    }
-
-
-    /*
-     * - _
-     */
-    if (scancode == 0x35)
-    {
-        return finish_character(
-            shift ? '_' : '-'
-        );
-    }
-
-
-    /*
-     * Tecla ISO extra:
-     *
-     * < > |
-     */
-    if (scancode == 0x56)
-    {
-        if (altgr)
-            return finish_character('|');
-
-        return finish_character(
-            shift ? '>' : '<'
-        );
-    }
-
-
-    /*
-     * Espacio.
-     */
-    if (scancode == 0x39)
-    {
-        return finish_character(' ');
-    }
-
-
-    /*
-     * ======================================
-     * NUMPAD
-     * ======================================
-     */
-
-    if (scancode == 0x37)
-        return finish_character('*');
-
-    if (scancode == 0x4A)
-        return finish_character('-');
-
-    if (scancode == 0x4E)
-        return finish_character('+');
 
 
     if (num_lock)
     {
-        switch (scancode)
+        switch (key)
         {
-            case 0x47: return '7';
-            case 0x48: return '8';
-            case 0x49: return '9';
+            case ROOT_KEY_KP_0: return '0';
+            case ROOT_KEY_KP_1: return '1';
+            case ROOT_KEY_KP_2: return '2';
+            case ROOT_KEY_KP_3: return '3';
+            case ROOT_KEY_KP_4: return '4';
+            case ROOT_KEY_KP_5: return '5';
+            case ROOT_KEY_KP_6: return '6';
+            case ROOT_KEY_KP_7: return '7';
+            case ROOT_KEY_KP_8: return '8';
+            case ROOT_KEY_KP_9: return '9';
+            case ROOT_KEY_KP_DOT: return '.';
 
-            case 0x4B: return '4';
-            case 0x4C: return '5';
-            case 0x4D: return '6';
-
-            case 0x4F: return '1';
-            case 0x50: return '2';
-            case 0x51: return '3';
-
-            case 0x52: return '0';
-            case 0x53: return '.';
+            default:
+                break;
         }
     }
 

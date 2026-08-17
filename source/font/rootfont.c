@@ -1,9 +1,30 @@
 #include "rootfont.h"
 
 
+typedef struct __attribute__((packed))
+{
+    u32 magic;
+
+    u32 version;
+
+    u32 glyph_count;
+
+} RootFontHeader;
+
+
+typedef struct __attribute__((packed))
+{
+    u32 codepoint;
+
+    u8 width;
+
+    u8 bitmap[32];
+
+} RootFontRecord;
+
+
 /*
- * Estos símbolos serán creados por objcopy
- * a partir de build/rootfont.bin.
+ * Generados por objcopy.
  */
 
 extern const u8
@@ -12,6 +33,203 @@ extern const u8
 extern const u8
     _binary_rootfont_bin_end[];
 
+
+/*
+ * ============================================================
+ * VALIDACION
+ * ============================================================
+ */
+
+static const RootFontHeader*
+rootfont_header(void)
+{
+    usize size =
+        (
+            usize
+        )(
+            _binary_rootfont_bin_end
+            -
+            _binary_rootfont_bin_start
+        );
+
+
+    if (
+        size
+        <
+        sizeof(
+            RootFontHeader
+        )
+    )
+    {
+        return NULL;
+    }
+
+
+    const RootFontHeader* header =
+        (
+            const RootFontHeader*
+        )
+        _binary_rootfont_bin_start;
+
+
+    if (
+        header->magic
+        !=
+        ROOTFONT_MAGIC
+    )
+    {
+        return NULL;
+    }
+
+
+    if (
+        header->version
+        !=
+        ROOTFONT_VERSION
+    )
+    {
+        return NULL;
+    }
+
+
+    usize expected =
+        sizeof(
+            RootFontHeader
+        )
+        +
+        (
+            usize
+        )
+        header->glyph_count
+        *
+        sizeof(
+            RootFontRecord
+        );
+
+
+    if (
+        expected > size
+    )
+    {
+        return NULL;
+    }
+
+
+    return header;
+}
+
+
+bool rootfont_ready(void)
+{
+    return
+        rootfont_header()
+        !=
+        NULL;
+}
+
+
+/*
+ * ============================================================
+ * BUSQUEDA BINARIA
+ * ============================================================
+ */
+
+static const RootFontRecord*
+find_record(
+    RootCodepoint codepoint
+)
+{
+    const RootFontHeader* header =
+        rootfont_header();
+
+
+    if (
+        header == NULL
+    )
+    {
+        return NULL;
+    }
+
+
+    const RootFontRecord* records =
+        (
+            const RootFontRecord*
+        )(
+            _binary_rootfont_bin_start
+            +
+            sizeof(
+                RootFontHeader
+            )
+        );
+
+
+    usize left = 0;
+
+    usize right =
+        header->glyph_count;
+
+
+    while (
+        left < right
+    )
+    {
+        usize middle =
+            left
+            +
+            (
+                right - left
+            )
+            /
+            2;
+
+
+        RootCodepoint current =
+            records[
+                middle
+            ].codepoint;
+
+
+        if (
+            current
+            ==
+            codepoint
+        )
+        {
+            return
+                &
+                records[
+                    middle
+                ];
+        }
+
+
+        if (
+            current
+            <
+            codepoint
+        )
+        {
+            left =
+                middle + 1;
+        }
+
+        else
+        {
+            right =
+                middle;
+        }
+    }
+
+
+    return NULL;
+}
+
+
+/*
+ * ============================================================
+ * API
+ * ============================================================
+ */
 
 bool rootfont_get_glyph(
     RootCodepoint codepoint,
@@ -26,90 +244,46 @@ bool rootfont_get_glyph(
     }
 
 
+    const RootFontRecord* record =
+        find_record(
+            codepoint
+        );
+
+
     /*
-     * Primera versión:
+     * Caracter inexistente:
      *
-     * Basic Multilingual Plane.
+     * U+FFFD
      */
     if (
+        record == NULL
+        &&
         codepoint
-        >=
-        ROOTFONT_BMP_COUNT
+        !=
+        ROOT_UNICODE_REPLACEMENT
     )
     {
-        codepoint =
-            ROOT_UNICODE_REPLACEMENT;
+        record =
+            find_record(
+                ROOT_UNICODE_REPLACEMENT
+            );
     }
 
 
-    usize offset =
-        (
-            usize
-        )
-        codepoint
-        *
-        ROOTFONT_RECORD_SIZE;
-
-
-    const u8* record =
-        _binary_rootfont_bin_start
-        +
-        offset;
-
-
-    u8 width =
-        record[0];
-
-
-    /*
-     * No existe glifo.
-     */
     if (
-        width != 8
-        &&
-        width != 16
+        record == NULL
     )
     {
-        /*
-         * Mostrar U+FFFD.
-         */
-
-        offset =
-            (
-                usize
-            )
-            ROOT_UNICODE_REPLACEMENT
-            *
-            ROOTFONT_RECORD_SIZE;
-
-
-        record =
-            _binary_rootfont_bin_start
-            +
-            offset;
-
-
-        width =
-            record[0];
-
-
-        if (
-            width != 8
-            &&
-            width != 16
-        )
-        {
-            return false;
-        }
+        return false;
     }
 
 
     glyph->width =
-        width;
+        record->width;
 
 
     glyph->bitmap =
-        record + 1;
+        record->bitmap;
 
 
     return true;

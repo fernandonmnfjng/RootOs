@@ -1,15 +1,17 @@
 #ifndef ROOTOS_KEYMAP_LATAM_H
 #define ROOTOS_KEYMAP_LATAM_H
 
-#include "io.h"
+#include "types.h"
+#include "unicode.h"
+#include "keycodes.h"
 
 
-u8 keymap_latam_translate(
-    u8 scancode,
-    int shift,
-    int altgr,
-    int caps_lock,
-    int num_lock
+RootCodepoint keymap_latam_translate(
+    RootKey key,
+    bool shift,
+    bool altgr,
+    bool caps_lock,
+    bool num_lock
 );
 
 

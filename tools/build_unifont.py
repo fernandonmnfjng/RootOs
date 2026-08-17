@@ -4,52 +4,37 @@ import sys
 import struct
 
 
-BMP_COUNT = 0x10000
-
-GLYPH_HEIGHT = 16
-
-RECORD_SIZE = 33
-
-REPLACEMENT = 0xFFFD
+MAGIC = 0x544E4652
+VERSION = 1
 
 
-def empty_glyph():
-    return bytearray(RECORD_SIZE)
+def convert_bitmap(hex_text):
+
+    raw = bytes.fromhex(
+        hex_text.strip()
+    )
 
 
-def parse_bitmap(hex_string):
-    """
-    GNU Unifont:
-
-    32 hex chars:
-        8x16
-
-    64 hex chars:
-        16x16
-
-    Algunas versiones pueden contener glifos
-    más anchos; por ahora RootOS acepta 8 y 16.
-    """
-
-    raw = bytes.fromhex(hex_string.strip())
-
-
+    # 8 x 16
     if len(raw) == 16:
-        width = 8
 
         bitmap = bytearray(32)
 
-        for y in range(16):
-            bitmap[y * 2] = raw[y]
-            bitmap[y * 2 + 1] = 0
+        for row in range(16):
 
-        return width, bitmap
+            bitmap[row * 2] = raw[row]
+
+            bitmap[
+                row * 2 + 1
+            ] = 0
+
+        return 8, bytes(bitmap)
 
 
+    # 16 x 16
     if len(raw) == 32:
-        width = 16
 
-        return width, bytearray(raw)
+        return 16, raw
 
 
     return None
@@ -58,43 +43,24 @@ def parse_bitmap(hex_string):
 def main():
 
     if len(sys.argv) != 3:
+
         print(
             "usage: build_unifont.py "
-            "<unifont.hex> <output.bin>"
+            "<unifont.hex> <rootfont.bin>"
         )
 
         return 1
 
 
-    input_file = sys.argv[1]
-
-    output_file = sys.argv[2]
-
-
-    """
-    Cada codepoint BMP ocupa exactamente:
-
-        1 byte  width
-        32      bitmap
-
-    Total:
-
-        65536 * 33
-        ~= 2.1 MiB
-    """
-
-    font = bytearray(
-        BMP_COUNT
-        *
-        RECORD_SIZE
-    )
+    source_path = sys.argv[1]
+    output_path = sys.argv[2]
 
 
-    glyph_count = 0
+    glyphs = {}
 
 
     with open(
-        input_file,
+        source_path,
         "r",
         encoding="ascii",
         errors="ignore"
@@ -104,90 +70,114 @@ def main():
 
             line = line.strip()
 
-
             if not line:
                 continue
-
 
             if ":" not in line:
                 continue
 
 
             code_text, bitmap_text = (
-                line.split(":", 1)
+                line.split(
+                    ":",
+                    1
+                )
             )
 
 
             try:
+
                 codepoint = int(
                     code_text,
                     16
                 )
 
             except ValueError:
+
                 continue
 
-
-            """
-            En esta primera versión guardamos
-            el Basic Multilingual Plane.
-            """
 
             if not (
                 0
                 <=
                 codepoint
-                <
-                BMP_COUNT
+                <=
+                0x10FFFF
             ):
                 continue
 
 
-            parsed = parse_bitmap(
+            converted = convert_bitmap(
                 bitmap_text
             )
 
 
-            if parsed is None:
+            if converted is None:
                 continue
 
 
-            width, bitmap = parsed
-
-
-            offset = (
-                codepoint
-                *
-                RECORD_SIZE
+            width, bitmap = (
+                converted
             )
 
 
-            font[offset] = width
+            glyphs[
+                codepoint
+            ] = (
+                width,
+                bitmap
+            )
 
 
-            font[
-                offset + 1:
-                offset + 33
-            ] = bitmap
-
-
-            glyph_count += 1
+    ordered = sorted(
+        glyphs.items(),
+        key=lambda item: item[0]
+    )
 
 
     with open(
-        output_file,
+        output_path,
         "wb"
     ) as output:
 
-        output.write(font)
+        # Header
+        output.write(
+            struct.pack(
+                "<III",
+                MAGIC,
+                VERSION,
+                len(ordered)
+            )
+        )
+
+
+        for (
+            codepoint,
+            (
+                width,
+                bitmap
+            )
+        ) in ordered:
+
+            output.write(
+                struct.pack(
+                    "<IB",
+                    codepoint,
+                    width
+                )
+            )
+
+            output.write(
+                bitmap
+            )
 
 
     print(
-        f"RootFont: {glyph_count} glyphs"
+        f"RootFont glyphs: {len(ordered)}"
     )
 
     print(
-        f"RootFont: {len(font)} bytes"
+        f"RootFont output: {output_path}"
     )
 
 
@@ -195,4 +185,7 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+
+    raise SystemExit(
+        main()
+    )
