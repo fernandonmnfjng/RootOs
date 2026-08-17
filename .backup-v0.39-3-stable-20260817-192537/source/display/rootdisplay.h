@@ -16,19 +16,6 @@ u32 rootdisplay_rgb(u8 red, u8 green, u8 blue);
 void rootdisplay_put_pixel(u32 x, u32 y, u32 color);
 u32 rootdisplay_get_pixel(u32 x, u32 y);
 
-/* Fast monochrome bitmap draw. Colors use canonical 0x00RRGGBB. */
-void rootdisplay_draw_mono_bitmap(
-    u32 x,
-    u32 y,
-    u32 width,
-    u32 height,
-    const u8* bitmap,
-    u32 stride_bytes,
-    u32 foreground,
-    u32 background,
-    bool opaque
-);
-
 void rootdisplay_fill_rect(
     u32 x,
     u32 y,

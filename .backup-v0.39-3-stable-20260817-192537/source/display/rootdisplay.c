@@ -151,15 +151,6 @@ static u32 pack_physical_color(u32 color)
     return packed;
 }
 
-static u32 physical_rgb_mask(void)
-{
-    u32 mask = 0;
-    mask |= channel_mask(red_size) << red_position;
-    mask |= channel_mask(green_size) << green_position;
-    mask |= channel_mask(blue_size) << blue_position;
-    return mask;
-}
-
 static u32 unpack_physical_color(u32 packed)
 {
     u32 red_raw =
@@ -214,7 +205,7 @@ static void raw_put_pixel(u32 x, u32 y, u32 color)
     );
 }
 
-static u32 raw_get_packed_pixel(u32 x, u32 y)
+static u32 raw_get_pixel(u32 x, u32 y)
 {
     if (!display_available || x >= display_width || y >= display_height)
         return 0;
@@ -231,14 +222,7 @@ static u32 raw_get_packed_pixel(u32 x, u32 y)
     if (display_bpp == 32)
         packed |= (u32)pixel[3] << 24;
 
-    return packed;
-}
-
-static u32 raw_get_pixel(u32 x, u32 y)
-{
-    return unpack_physical_color(
-        raw_get_packed_pixel(x, y)
-    );
+    return unpack_physical_color(packed);
 }
 
 /* ============================================================
@@ -566,77 +550,6 @@ u32 rootdisplay_get_pixel(u32 x, u32 y)
     return raw_get_pixel(x, y);
 }
 
-void rootdisplay_draw_mono_bitmap(
-    u32 x,
-    u32 y,
-    u32 width,
-    u32 height,
-    const u8* bitmap,
-    u32 stride_bytes,
-    u32 foreground,
-    u32 background,
-    bool opaque
-)
-{
-    if (
-        !display_available ||
-        bitmap == NULL ||
-        width == 0 ||
-        height == 0 ||
-        stride_bytes == 0 ||
-        x >= display_width ||
-        y >= display_height
-    )
-    {
-        return;
-    }
-
-    u32 draw_width = width;
-    u32 draw_height = height;
-
-    if (draw_width > display_width - x)
-        draw_width = display_width - x;
-
-    if (draw_height > display_height - y)
-        draw_height = display_height - y;
-
-    u32 foreground_packed = pack_physical_color(foreground);
-    u32 background_packed = pack_physical_color(background);
-
-    rootdisplay_begin_update();
-
-    for (u32 py = 0; py < draw_height; py++)
-    {
-        const u8* row = bitmap + (usize)py * stride_bytes;
-
-        for (u32 px = 0; px < draw_width; px++)
-        {
-            u8 byte = row[px / 8u];
-            u8 bit = (u8)(7u - (px % 8u));
-            bool set = (byte & (u8)(1u << bit)) != 0;
-
-            if (set)
-            {
-                raw_put_packed_pixel(
-                    x + px,
-                    y + py,
-                    foreground_packed
-                );
-            }
-            else if (opaque)
-            {
-                raw_put_packed_pixel(
-                    x + px,
-                    y + py,
-                    background_packed
-                );
-            }
-        }
-    }
-
-    rootdisplay_end_update();
-}
-
 void rootdisplay_fill_rect(
     u32 x,
     u32 y,
@@ -705,57 +618,18 @@ void rootdisplay_invert_rect(
     if (end_y < y || end_y > display_height)
         end_y = display_height;
 
-    /*
-     * Selection highlighting is hot-path rendering. Invert the
-     * framebuffer's packed RGB bits directly; do not unpack and
-     * repack every pixel.
-     */
-    u32 mask = physical_rgb_mask();
-
     rootdisplay_begin_update();
 
     for (u32 py = y; py < end_y; py++)
     {
         for (u32 px = x; px < end_x; px++)
         {
-            u32 packed = raw_get_packed_pixel(px, py);
-            raw_put_packed_pixel(px, py, packed ^ mask);
+            u32 color = raw_get_pixel(px, py);
+            raw_put_pixel(px, py, color ^ 0x00FFFFFFu);
         }
     }
 
     rootdisplay_end_update();
-}
-
-static void framebuffer_copy_forward(
-    volatile u8* destination,
-    const volatile u8* source,
-    usize bytes
-)
-{
-    /*
-     * The framebuffer is normally 32-bit aligned. Copy four bytes
-     * per iteration whenever alignment allows it. This is materially
-     * faster than the previous byte-at-a-time scroll path.
-     */
-    if (
-        ((((usize)destination) | ((usize)source)) & 3u) == 0
-    )
-    {
-        volatile u32* dst32 = (volatile u32*)destination;
-        const volatile u32* src32 = (const volatile u32*)source;
-        usize words = bytes / 4u;
-
-        for (usize i = 0; i < words; i++)
-            dst32[i] = src32[i];
-
-        usize copied = words * 4u;
-        destination += copied;
-        source += copied;
-        bytes -= copied;
-    }
-
-    for (usize i = 0; i < bytes; i++)
-        destination[i] = source[i];
 }
 
 void rootdisplay_scroll_up(
@@ -781,11 +655,9 @@ void rootdisplay_scroll_up(
         ((usize)display_height - pixel_rows) *
         (usize)display_pitch;
 
-    framebuffer_copy_forward(
-        framebuffer,
-        framebuffer + source_offset,
-        bytes_to_move
-    );
+    /* Destination is below source address, forward copy is safe. */
+    for (usize i = 0; i < bytes_to_move; i++)
+        framebuffer[i] = framebuffer[source_offset + i];
 
     u32 start_y = display_height - pixel_rows;
     u32 packed_fill = pack_physical_color(fill_color);

@@ -2606,35 +2606,6 @@ static void shell_mouse_click(
 
 /*
  * ============================================================
- * COMMAND OUTPUT BATCHING
- * ============================================================
- *
- * Most commands return to the shell immediately and can render their
- * output as one transaction. Full-screen/terminal-owning commands must
- * remain live while they run.
- */
-static bool shell_command_can_batch(
-    const char* command
-)
-{
-    if (command == NULL)
-        return false;
-
-    if (
-        root_streq(command, "reboot") ||
-        root_streq(command, "shutdown") ||
-        root_streq(command, "editfile") ||
-        root_starts_with(command, "editfile ")
-    )
-    {
-        return false;
-    }
-
-    return true;
-}
-
-/*
- * ============================================================
  * SHELL LOOP
  * ============================================================
  */
@@ -2855,18 +2826,7 @@ void shell_run(void)
             shell_history_add_current();
 
             if (shell_build_utf8())
-            {
-                bool batched =
-                    shell_command_can_batch(command_utf8);
-
-                if (batched)
-                    terminal_begin_output_batch();
-
                 execute_command(command_utf8);
-
-                if (batched)
-                    terminal_end_batch();
-            }
 
             command_length = 0;
             command_cursor = 0;

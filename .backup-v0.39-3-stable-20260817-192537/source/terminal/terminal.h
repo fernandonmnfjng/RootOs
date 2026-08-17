@@ -10,8 +10,6 @@ void terminal_clear_row(u32 row);
 
 /* Batch many cell writes into one cursor/mouse update. */
 void terminal_begin_batch(void);
-/* Optimized for commands that may emit many characters/lines. */
-void terminal_begin_output_batch(void);
 void terminal_end_batch(void);
 
 void terminal_putchar(char c);

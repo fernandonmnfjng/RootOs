@@ -16,9 +16,6 @@ static bool num_lock = false;
 
 static bool extended = false;
 
-/* Pause/Break uses the Set-1 E1 1D 45 E1 9D C5 sequence. */
-static u8 pause_bytes_remaining = 0;
-
 
 /*
  * ============================================================
@@ -264,7 +261,6 @@ void keyboard_reset(void)
     num_lock = false;
 
     extended = false;
-    pause_bytes_remaining = 0;
 
     keymap_latam_reset();
 }
@@ -279,26 +275,6 @@ bool keyboard_feed_byte(
         event == NULL
     )
     {
-        return false;
-    }
-
-
-    /*
-     * Pause/Break en Set 1 emite una secuencia E1 de 6 bytes
-     * que contiene 0x1D/0x9D. Si no se filtra, esos bytes se
-     * parecen a Ctrl down/up y pueden producir un Ctrl fantasma.
-     */
-    if (pause_bytes_remaining > 0)
-    {
-        pause_bytes_remaining--;
-        return false;
-    }
-
-
-    if (scancode == 0xE1)
-    {
-        pause_bytes_remaining = 5;
-        extended = false;
         return false;
     }
 
@@ -429,18 +405,8 @@ bool keyboard_feed_byte(
 
     /*
      * Solo KEY DOWN genera texto.
-     *
-     * Ctrl y Alt son modificadores de comandos: nunca deben
-     * producir caracteres. AltGr sí puede producir texto en el
-     * layout LATAM, salvo que Ctrl se esté manteniendo de verdad.
      */
-    bool text_modifier_ok =
-        (!ctrl && !alt)
-        ||
-        (altgr && !ctrl && !alt);
-
-
-    if (pressed && text_modifier_ok)
+    if (pressed)
     {
         codepoint =
             keymap_latam_translate(

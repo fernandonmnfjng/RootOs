@@ -78,9 +78,6 @@ static u32 editor_view_line =
 static u32 editor_horizontal_offset =
     0;
 
-/* -1 forces the first status render. */
-static i32 editor_status_cache = -1;
-
 
 /*
  * ============================================================
@@ -98,9 +95,6 @@ static usize selection_anchor =
 
 static bool selection_drawn =
     false;
-
-static usize selection_drawn_start = 0;
-static usize selection_drawn_end = 0;
 
 
 static bool mouse_selecting =
@@ -165,14 +159,8 @@ static void editor_snapshot_capture(
     snapshot->length = editor_length;
     snapshot->cursor = editor_cursor;
 
-    if (editor_length > 0)
-    {
-        root_memcpy(
-            snapshot->buffer,
-            editor_buffer,
-            editor_length * sizeof(RootCodepoint)
-        );
-    }
+    for (usize i = 0; i < editor_length; i++)
+        snapshot->buffer[i] = editor_buffer[i];
 }
 
 
@@ -186,14 +174,8 @@ static void editor_snapshot_restore(
     editor_length = snapshot->length;
     editor_cursor = snapshot->cursor;
 
-    if (editor_length > 0)
-    {
-        root_memcpy(
-            editor_buffer,
-            snapshot->buffer,
-            editor_length * sizeof(RootCodepoint)
-        );
-    }
+    for (usize i = 0; i < editor_length; i++)
+        editor_buffer[i] = snapshot->buffer[i];
 
     selection_active = false;
     selection_drawn = false;
@@ -447,7 +429,6 @@ static void editor_clear_row(
      * reappear until the following key press. Keep both layers synced.
      */
     terminal_clear_row(row);
-    terminal_set_cursor(0, row);
 }
 
 
@@ -720,9 +701,6 @@ static void editor_selection_clear(void)
 
     selection_drawn =
         false;
-
-    selection_drawn_start = 0;
-    selection_drawn_end = 0;
 }
 
 
@@ -790,203 +768,308 @@ static bool editor_range_has_newline(
  * ============================================================
  */
 
-static void editor_invert_selection_range(
-    usize start,
-    usize end
-)
+static void editor_toggle_selection_visual(void)
 {
     if (
-        start >= end ||
+        !selection_active
+        ||
         !rootdisplay_ready()
     )
     {
         return;
     }
 
-    if (end > editor_length)
-        end = editor_length;
 
-    u32 first_visible_line = editor_view_line;
-    u32 last_visible_line =
-        editor_view_line + editor_body_rows();
+    usize start =
+        editor_selection_start();
 
-    u32 start_line =
-        editor_line_number_from_index(start);
 
-    u32 end_line =
-        editor_line_number_from_index(end);
+    usize end =
+        editor_selection_end();
+
 
     if (
-        end_line < first_visible_line ||
-        start_line >= last_visible_line
+        start == end
     )
     {
         return;
     }
 
-    u32 from_line = start_line;
-    if (from_line < first_visible_line)
-        from_line = first_visible_line;
 
-    u32 to_line = end_line;
-    if (to_line >= last_visible_line)
-        to_line = last_visible_line - 1u;
+    u32 first_visible_line =
+        editor_view_line;
 
-    for (u32 line = from_line; line <= to_line; line++)
+
+    u32 last_visible_line =
+        editor_view_line
+        +
+        editor_body_rows();
+
+
+    u32 start_line =
+        editor_line_number_from_index(
+            start
+        );
+
+
+    u32 end_line =
+        editor_line_number_from_index(
+            end
+        );
+
+
+    if (
+        end_line
+        <
+        first_visible_line
+        ||
+        start_line
+        >=
+        last_visible_line
+    )
+    {
+        return;
+    }
+
+
+    rootdisplay_begin_update();
+
+
+    u32 from_line =
+        start_line;
+
+
+    if (
+        from_line
+        <
+        first_visible_line
+    )
+    {
+        from_line =
+            first_visible_line;
+    }
+
+
+    u32 to_line =
+        end_line;
+
+
+    if (
+        to_line
+        >=
+        last_visible_line
+    )
+    {
+        to_line =
+            last_visible_line
+            -
+            1;
+    }
+
+
+    for (
+        u32 line = from_line;
+        line <= to_line;
+        line++
+    )
     {
         usize line_start =
-            editor_line_start_by_number(line);
+            editor_line_start_by_number(
+                line
+            );
+
 
         usize line_end =
-            editor_line_end_from_index(line_start);
+            editor_line_end_from_index(
+                line_start
+            );
 
-        usize segment_start = start;
-        usize segment_end = end;
 
-        if (segment_start < line_start)
-            segment_start = line_start;
+        usize segment_start =
+            start;
 
-        if (segment_end > line_end)
-            segment_end = line_end;
 
-        if (segment_start >= segment_end)
+        usize segment_end =
+            end;
+
+
+        if (
+            segment_start
+            <
+            line_start
+        )
+        {
+            segment_start =
+                line_start;
+        }
+
+
+        if (
+            segment_end
+            >
+            line_end
+        )
+        {
+            segment_end =
+                line_end;
+        }
+
+
+        if (
+            segment_start
+            >=
+            segment_end
+        )
+        {
             continue;
+        }
+
 
         u32 visual_start =
-            editor_visual_column(line_start, segment_start);
+            editor_visual_column(
+                line_start,
+                segment_start
+            );
+
 
         u32 visual_end =
-            editor_visual_column(line_start, segment_end);
+            editor_visual_column(
+                line_start,
+                segment_end
+            );
 
-        if (visual_end <= editor_horizontal_offset)
+
+        if (
+            visual_end
+            <=
+            editor_horizontal_offset
+        )
+        {
             continue;
+        }
 
-        if (visual_start < editor_horizontal_offset)
-            visual_start = editor_horizontal_offset;
+
+        if (
+            visual_start
+            <
+            editor_horizontal_offset
+        )
+        {
+            visual_start =
+                editor_horizontal_offset;
+        }
+
 
         u32 screen_start =
-            visual_start - editor_horizontal_offset;
+            visual_start
+            -
+            editor_horizontal_offset;
+
 
         u32 screen_end =
-            visual_end - editor_horizontal_offset;
+            visual_end
+            -
+            editor_horizontal_offset;
 
-        u32 columns = editor_columns();
 
-        if (screen_start >= columns)
+        u32 columns =
+            editor_columns();
+
+
+        if (
+            screen_start >= columns
+        )
+        {
             continue;
+        }
 
-        if (screen_end > columns)
-            screen_end = columns;
 
-        if (screen_end <= screen_start)
+        if (
+            screen_end > columns
+        )
+        {
+            screen_end =
+                columns;
+        }
+
+
+        if (
+            screen_end
+            <=
+            screen_start
+        )
+        {
             continue;
+        }
+
 
         u32 screen_row =
-            ROOTEDIT_BODY_START_ROW +
-            (line - editor_view_line);
+            ROOTEDIT_BODY_START_ROW
+            +
+            (
+                line
+                -
+                editor_view_line
+            );
+
 
         rootdisplay_invert_rect(
-            screen_start * ROOTEDIT_CELL_WIDTH,
-            screen_row * ROOTEDIT_CELL_HEIGHT,
-            (screen_end - screen_start) * ROOTEDIT_CELL_WIDTH,
+            screen_start
+            *
+            ROOTEDIT_CELL_WIDTH,
+
+            screen_row
+            *
+            ROOTEDIT_CELL_HEIGHT,
+
+            (
+                screen_end
+                -
+                screen_start
+            )
+            *
+            ROOTEDIT_CELL_WIDTH,
+
             ROOTEDIT_CELL_HEIGHT
         );
     }
+
+
+    rootdisplay_end_update();
 }
 
 
 static void editor_selection_hide(void)
 {
-    if (!selection_drawn)
-        return;
+    if (
+        selection_drawn
+    )
+    {
+        editor_toggle_selection_visual();
 
-    rootdisplay_begin_update();
-    editor_invert_selection_range(
-        selection_drawn_start,
-        selection_drawn_end
-    );
-    rootdisplay_end_update();
 
-    selection_drawn = false;
+        selection_drawn =
+            false;
+    }
 }
 
 
 static void editor_selection_show(void)
 {
     if (
-        !selection_active ||
-        editor_selection_start() == editor_selection_end()
+        selection_active
+        &&
+        editor_selection_start()
+        !=
+        editor_selection_end()
     )
     {
-        editor_selection_hide();
-        return;
+        editor_toggle_selection_visual();
+
+
+        selection_drawn =
+            true;
     }
-
-    usize new_start = editor_selection_start();
-    usize new_end = editor_selection_end();
-
-    rootdisplay_begin_update();
-
-    if (!selection_drawn)
-    {
-        editor_invert_selection_range(new_start, new_end);
-    }
-    else if (
-        new_end <= selection_drawn_start ||
-        new_start >= selection_drawn_end
-    )
-    {
-        /* Disjoint selection ranges. */
-        editor_invert_selection_range(
-            selection_drawn_start,
-            selection_drawn_end
-        );
-
-        editor_invert_selection_range(new_start, new_end);
-    }
-    else
-    {
-        /*
-         * Overlapping ranges: invert only the symmetric difference.
-         * Dragging by one character therefore touches one character,
-         * not the complete selection.
-         */
-        if (new_start < selection_drawn_start)
-        {
-            editor_invert_selection_range(
-                new_start,
-                selection_drawn_start
-            );
-        }
-        else if (new_start > selection_drawn_start)
-        {
-            editor_invert_selection_range(
-                selection_drawn_start,
-                new_start
-            );
-        }
-
-        if (new_end > selection_drawn_end)
-        {
-            editor_invert_selection_range(
-                selection_drawn_end,
-                new_end
-            );
-        }
-        else if (new_end < selection_drawn_end)
-        {
-            editor_invert_selection_range(
-                new_end,
-                selection_drawn_end
-            );
-        }
-    }
-
-    rootdisplay_end_update();
-
-    selection_drawn_start = new_start;
-    selection_drawn_end = new_end;
-    selection_drawn = true;
 }
 
 
@@ -1399,30 +1482,51 @@ static void editor_draw_header(void)
 
 static void editor_draw_status(void)
 {
-    i32 status =
-        editor_save_error ? 2 :
-        (editor_dirty ? 1 : 0);
+    u32 row =
+        editor_rows()
+        -
+        1;
 
-    /*
-     * Selection changes happen at mouse-event frequency. They do not
-     * need to rewrite the status row. Only file-state changes do.
-     */
-    if (status == editor_status_cache)
-        return;
 
-    editor_status_cache = status;
+    editor_clear_row(
+        row
+    );
 
-    u32 row = editor_rows() - 1u;
 
-    editor_clear_row(row);
-    terminal_set_cursor(0, row);
+    if (
+        editor_save_error
+    )
+    {
+        terminal_print(
+            "[SAVE ERROR]"
+        );
+    }
 
-    if (editor_save_error)
-        terminal_print("[SAVE ERROR]");
-    else if (editor_dirty)
-        terminal_print("[MODIFIED]");
+    else if (
+        editor_dirty
+    )
+    {
+        terminal_print(
+            "[MODIFIED]"
+        );
+    }
+
     else
-        terminal_print("[SAVED]");
+    {
+        terminal_print(
+            "[SAVED]"
+        );
+    }
+
+
+    if (
+        selection_active
+    )
+    {
+        terminal_print(
+            " [SELECTION]"
+        );
+    }
 }
 
 
@@ -1440,8 +1544,6 @@ static void editor_redraw_full(void)
 
     selection_drawn =
         false;
-    selection_drawn_start = 0;
-    selection_drawn_end = 0;
 
 
     terminal_begin_batch();
@@ -2342,8 +2444,6 @@ static FsResult editor_load(
     editor_horizontal_offset =
         0;
 
-    editor_status_cache = -1;
-
 
     selection_active =
         false;
@@ -2589,6 +2689,7 @@ FsResult rootedit_open(
                 &index
             ))
             {
+                editor_selection_hide();
                 editor_cursor = index;
                 selection_active = editor_cursor != selection_anchor;
 
@@ -2756,6 +2857,7 @@ FsResult rootedit_open(
         )
         {
             editor_break_undo_group();
+            editor_selection_hide();
 
             if (!selection_active)
                 selection_anchor = editor_cursor;

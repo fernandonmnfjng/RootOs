@@ -8,7 +8,7 @@
 #include "memory.h"
 #include "time.h"
 
-#define ROOT_INPUT_QUEUE_SIZE 256
+#define ROOT_INPUT_QUEUE_SIZE 128
 
 
 #define MOUSE_MASK_LEFT   0x01
@@ -66,68 +66,10 @@ static i32 last_click_y[4];
  * ============================================================
  */
 
-static bool queue_motion_type(
-    RootInputEventType type
-)
-{
-    return
-        type == ROOT_INPUT_MOUSE_MOVE
-        ||
-        type == ROOT_INPUT_MOUSE_DRAG;
-}
-
-
 static void queue_push(
     const RootInputEvent* event
 )
 {
-    if (event == NULL)
-    {
-        return;
-    }
-
-
-    /*
-     * Mouse motion can arrive much faster than applications consume
-     * events. Keeping every intermediate coordinate only fills the
-     * queue and can delay/drop keyboard events. Consecutive motion
-     * events are therefore coalesced into the newest position.
-     */
-    if (
-        queue_head != queue_tail
-        &&
-        queue_motion_type(event->type)
-    )
-    {
-        u32 last =
-            (
-                queue_head
-                +
-                ROOT_INPUT_QUEUE_SIZE
-                -
-                1
-            )
-            %
-            ROOT_INPUT_QUEUE_SIZE;
-
-
-        if (
-            queue[last].type == event->type
-            &&
-            queue[last].mouse_buttons == event->mouse_buttons
-        )
-        {
-            queue[last].timestamp_ms = event->timestamp_ms;
-            queue[last].mouse_x = event->mouse_x;
-            queue[last].mouse_y = event->mouse_y;
-            queue[last].mouse_dx += event->mouse_dx;
-            queue[last].mouse_dy += event->mouse_dy;
-            queue[last].button = event->button;
-            return;
-        }
-    }
-
-
     u32 next =
         (
             queue_head + 1
@@ -137,11 +79,12 @@ static void queue_push(
 
 
     /*
-     * Fixed-size queue: never grow RAM indefinitely. If it becomes
-     * full, discard the oldest queued event. Motion coalescing makes
-     * this considerably less likely during normal use.
+     * Cola llena:
+     * eliminar evento más viejo.
      */
-    if (next == queue_tail)
+    if (
+        next == queue_tail
+    )
     {
         queue_tail =
             (
@@ -152,8 +95,14 @@ static void queue_push(
     }
 
 
-    queue[queue_head] = *event;
-    queue_head = next;
+    queue[
+        queue_head
+    ] =
+        *event;
+
+
+    queue_head =
+        next;
 }
 
 

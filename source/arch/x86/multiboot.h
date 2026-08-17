@@ -4,19 +4,28 @@
 #include "types.h"
 
 
-#define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002
+/*
+ * ============================================================
+ * MULTIBOOT CONSTANTS
+ * ============================================================
+ */
+
+#define MULTIBOOT_BOOTLOADER_MAGIC \
+    0x2BADB002u
+
 
 #define MULTIBOOT_INFO_FRAMEBUFFER \
     (1u << 12)
 
 
 /*
- * Estructura Multiboot 1.
+ * ============================================================
+ * MULTIBOOT INFORMATION STRUCTURE
+ * ============================================================
  *
- * Los offsets son importantes.
- *
- * framebuffer_addr comienza en offset 88.
+ * Layout compatible con Multiboot v1.
  */
+
 typedef struct __attribute__((packed))
 {
     u32 flags;
@@ -33,19 +42,21 @@ typedef struct __attribute__((packed))
 
 
     /*
-     * a.out / ELF symbol information.
+     * a.out / ELF symbols.
      *
-     * En ambos casos esta zona ocupa
-     * exactamente 16 bytes.
+     * Ambas variantes ocupan 16 bytes.
      */
-    u32 syms[4];
+
+    u32 symbols[4];
 
 
     u32 mmap_length;
     u32 mmap_addr;
 
+
     u32 drives_length;
     u32 drives_addr;
+
 
     u32 config_table;
 
@@ -57,19 +68,24 @@ typedef struct __attribute__((packed))
     /*
      * VBE.
      */
+
     u32 vbe_control_info;
+
     u32 vbe_mode_info;
 
     u16 vbe_mode;
+
     u16 vbe_interface_seg;
+
     u16 vbe_interface_off;
+
     u16 vbe_interface_len;
 
 
     /*
-     * ==========================================
+     * ========================================================
      * FRAMEBUFFER
-     * ==========================================
+     * ========================================================
      */
 
     u64 framebuffer_addr;
@@ -77,6 +93,7 @@ typedef struct __attribute__((packed))
     u32 framebuffer_pitch;
 
     u32 framebuffer_width;
+
     u32 framebuffer_height;
 
     u8 framebuffer_bpp;
@@ -85,17 +102,23 @@ typedef struct __attribute__((packed))
 
 
     /*
-     * Para framebuffer_type == 1:
-     * color RGB directo.
+     * Direct RGB framebuffer.
+     *
+     * Solo usamos estos campos cuando:
+     *
+     * framebuffer_type == 1
      */
 
     u8 framebuffer_red_field_position;
+
     u8 framebuffer_red_mask_size;
 
     u8 framebuffer_green_field_position;
+
     u8 framebuffer_green_mask_size;
 
     u8 framebuffer_blue_field_position;
+
     u8 framebuffer_blue_mask_size;
 
 } MultibootInfo;

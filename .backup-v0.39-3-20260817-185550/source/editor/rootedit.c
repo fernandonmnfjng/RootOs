@@ -3,13 +3,10 @@
 #include "terminal.h"
 #include "rootinput.h"
 #include "rootdisplay.h"
-#include "rootclipboard.h"
-#include "roottext.h"
 
 #include "unicode.h"
 
 #include "string.h"
-#include "memory.h"
 
 #include "path.h"
 
@@ -78,9 +75,6 @@ static u32 editor_view_line =
 static u32 editor_horizontal_offset =
     0;
 
-/* -1 forces the first status render. */
-static i32 editor_status_cache = -1;
-
 
 /*
  * ============================================================
@@ -99,9 +93,6 @@ static usize selection_anchor =
 static bool selection_drawn =
     false;
 
-static usize selection_drawn_start = 0;
-static usize selection_drawn_end = 0;
-
 
 static bool mouse_selecting =
     false;
@@ -109,271 +100,17 @@ static bool mouse_selecting =
 
 /*
  * ============================================================
- * UNDO / REDO
- * ============================================================
- *
- * Snapshots are fixed-size and kept in a ring. Typing and repeated
- * deletion are grouped, so we do not copy 4 Ki codepoints for every
- * key repeat. Memory use is bounded and predictable.
- */
-
-#define ROOTEDIT_UNDO_DEPTH 24u
-
-typedef struct
-{
-    RootCodepoint buffer[ROOTEDIT_MAX_CODEPOINTS];
-    usize length;
-    usize cursor;
-} RootEditSnapshot;
-
-typedef enum
-{
-    ROOTEDIT_GROUP_NONE = 0,
-    ROOTEDIT_GROUP_INSERT,
-    ROOTEDIT_GROUP_BACKSPACE,
-    ROOTEDIT_GROUP_DELETE
-} RootEditUndoGroup;
-
-static RootEditSnapshot undo_stack[ROOTEDIT_UNDO_DEPTH];
-static RootEditSnapshot redo_stack[ROOTEDIT_UNDO_DEPTH];
-
-/* Avoid placing ~16 KiB snapshots on the kernel stack. */
-static RootEditSnapshot undo_scratch_a;
-static RootEditSnapshot undo_scratch_b;
-
-static u32 undo_start = 0;
-static u32 undo_count = 0;
-static u32 redo_start = 0;
-static u32 redo_count = 0;
-
-static RootEditUndoGroup undo_group = ROOTEDIT_GROUP_NONE;
-
-
-/*
- * ============================================================
- * UNDO HELPERS
+ * INTERNAL CLIPBOARD
  * ============================================================
  */
 
-static void editor_snapshot_capture(
-    RootEditSnapshot* snapshot
-)
-{
-    if (snapshot == NULL)
-        return;
-
-    snapshot->length = editor_length;
-    snapshot->cursor = editor_cursor;
-
-    if (editor_length > 0)
-    {
-        root_memcpy(
-            snapshot->buffer,
-            editor_buffer,
-            editor_length * sizeof(RootCodepoint)
-        );
-    }
-}
+static RootCodepoint editor_clipboard[
+    ROOTEDIT_MAX_CODEPOINTS
+];
 
 
-static void editor_snapshot_restore(
-    const RootEditSnapshot* snapshot
-)
-{
-    if (snapshot == NULL)
-        return;
-
-    editor_length = snapshot->length;
-    editor_cursor = snapshot->cursor;
-
-    if (editor_length > 0)
-    {
-        root_memcpy(
-            editor_buffer,
-            snapshot->buffer,
-            editor_length * sizeof(RootCodepoint)
-        );
-    }
-
-    selection_active = false;
-    selection_drawn = false;
-    mouse_selecting = false;
-    selection_anchor = editor_cursor;
-
-    editor_dirty = true;
-    editor_save_error = false;
-}
-
-
-static void snapshot_stack_push(
-    RootEditSnapshot* stack,
-    u32* start,
-    u32* count,
-    const RootEditSnapshot* snapshot
-)
-{
-    if (
-        stack == NULL ||
-        start == NULL ||
-        count == NULL ||
-        snapshot == NULL
-    )
-    {
-        return;
-    }
-
-    u32 index;
-
-    if (*count < ROOTEDIT_UNDO_DEPTH)
-    {
-        index = (*start + *count) % ROOTEDIT_UNDO_DEPTH;
-        (*count)++;
-    }
-    else
-    {
-        index = *start;
-        *start = (*start + 1) % ROOTEDIT_UNDO_DEPTH;
-    }
-
-    stack[index].length = snapshot->length;
-    stack[index].cursor = snapshot->cursor;
-
-    if (snapshot->length > 0)
-    {
-        root_memcpy(
-            stack[index].buffer,
-            snapshot->buffer,
-            snapshot->length * sizeof(RootCodepoint)
-        );
-    }
-}
-
-
-static bool snapshot_stack_pop(
-    RootEditSnapshot* stack,
-    u32* start,
-    u32* count,
-    RootEditSnapshot* output
-)
-{
-    if (
-        stack == NULL ||
-        start == NULL ||
-        count == NULL ||
-        output == NULL ||
-        *count == 0
-    )
-    {
-        return false;
-    }
-
-    u32 index =
-        (*start + *count - 1) % ROOTEDIT_UNDO_DEPTH;
-
-    output->length = stack[index].length;
-    output->cursor = stack[index].cursor;
-
-    if (output->length > 0)
-    {
-        root_memcpy(
-            output->buffer,
-            stack[index].buffer,
-            output->length * sizeof(RootCodepoint)
-        );
-    }
-
-    (*count)--;
-
-    if (*count == 0)
-    {
-        *start = 0;
-    }
-
-    return true;
-}
-
-
-static void editor_break_undo_group(void)
-{
-    undo_group = ROOTEDIT_GROUP_NONE;
-}
-
-
-static void editor_record_undo(
-    RootEditUndoGroup group,
-    bool force_new
-)
-{
-    if (!force_new && undo_group == group)
-        return;
-
-    editor_snapshot_capture(&undo_scratch_a);
-
-    snapshot_stack_push(
-        undo_stack,
-        &undo_start,
-        &undo_count,
-        &undo_scratch_a
-    );
-
-    redo_start = 0;
-    redo_count = 0;
-    undo_group = group;
-}
-
-
-static bool editor_undo(void)
-{
-    if (!snapshot_stack_pop(
-        undo_stack,
-        &undo_start,
-        &undo_count,
-        &undo_scratch_a
-    ))
-    {
-        return false;
-    }
-
-    editor_snapshot_capture(&undo_scratch_b);
-
-    snapshot_stack_push(
-        redo_stack,
-        &redo_start,
-        &redo_count,
-        &undo_scratch_b
-    );
-
-    editor_snapshot_restore(&undo_scratch_a);
-    editor_break_undo_group();
-    return true;
-}
-
-
-static bool editor_redo(void)
-{
-    if (!snapshot_stack_pop(
-        redo_stack,
-        &redo_start,
-        &redo_count,
-        &undo_scratch_a
-    ))
-    {
-        return false;
-    }
-
-    editor_snapshot_capture(&undo_scratch_b);
-
-    snapshot_stack_push(
-        undo_stack,
-        &undo_start,
-        &undo_count,
-        &undo_scratch_b
-    );
-
-    editor_snapshot_restore(&undo_scratch_a);
-    editor_break_undo_group();
-    return true;
-}
+static usize editor_clipboard_length =
+    0;
 
 
 /*
@@ -441,13 +178,63 @@ static void editor_clear_row(
     u32 row
 )
 {
-    /*
-     * terminal_cells is the source of truth for the text cursor.
-     * Clearing only framebuffer pixels caused deleted characters to
-     * reappear until the following key press. Keep both layers synced.
-     */
-    terminal_clear_row(row);
-    terminal_set_cursor(0, row);
+    if (
+        rootdisplay_ready()
+    )
+    {
+        rootdisplay_fill_rect(
+            0,
+            row
+            *
+            ROOTEDIT_CELL_HEIGHT,
+
+            rootdisplay_width(),
+            ROOTEDIT_CELL_HEIGHT,
+
+            rootdisplay_rgb(
+                0,
+                0,
+                0
+            )
+        );
+
+
+        terminal_set_cursor(
+            0,
+            row
+        );
+
+
+        return;
+    }
+
+
+    u32 columns =
+        editor_columns();
+
+
+    terminal_set_cursor(
+        0,
+        row
+    );
+
+
+    for (
+        u32 i = 0;
+        i < columns;
+        i++
+    )
+    {
+        terminal_putchar(
+            ' '
+        );
+    }
+
+
+    terminal_set_cursor(
+        0,
+        row
+    );
 }
 
 
@@ -720,9 +507,6 @@ static void editor_selection_clear(void)
 
     selection_drawn =
         false;
-
-    selection_drawn_start = 0;
-    selection_drawn_end = 0;
 }
 
 
@@ -790,203 +574,308 @@ static bool editor_range_has_newline(
  * ============================================================
  */
 
-static void editor_invert_selection_range(
-    usize start,
-    usize end
-)
+static void editor_toggle_selection_visual(void)
 {
     if (
-        start >= end ||
+        !selection_active
+        ||
         !rootdisplay_ready()
     )
     {
         return;
     }
 
-    if (end > editor_length)
-        end = editor_length;
 
-    u32 first_visible_line = editor_view_line;
-    u32 last_visible_line =
-        editor_view_line + editor_body_rows();
+    usize start =
+        editor_selection_start();
 
-    u32 start_line =
-        editor_line_number_from_index(start);
 
-    u32 end_line =
-        editor_line_number_from_index(end);
+    usize end =
+        editor_selection_end();
+
 
     if (
-        end_line < first_visible_line ||
-        start_line >= last_visible_line
+        start == end
     )
     {
         return;
     }
 
-    u32 from_line = start_line;
-    if (from_line < first_visible_line)
-        from_line = first_visible_line;
 
-    u32 to_line = end_line;
-    if (to_line >= last_visible_line)
-        to_line = last_visible_line - 1u;
+    u32 first_visible_line =
+        editor_view_line;
 
-    for (u32 line = from_line; line <= to_line; line++)
+
+    u32 last_visible_line =
+        editor_view_line
+        +
+        editor_body_rows();
+
+
+    u32 start_line =
+        editor_line_number_from_index(
+            start
+        );
+
+
+    u32 end_line =
+        editor_line_number_from_index(
+            end
+        );
+
+
+    if (
+        end_line
+        <
+        first_visible_line
+        ||
+        start_line
+        >=
+        last_visible_line
+    )
+    {
+        return;
+    }
+
+
+    rootdisplay_begin_update();
+
+
+    u32 from_line =
+        start_line;
+
+
+    if (
+        from_line
+        <
+        first_visible_line
+    )
+    {
+        from_line =
+            first_visible_line;
+    }
+
+
+    u32 to_line =
+        end_line;
+
+
+    if (
+        to_line
+        >=
+        last_visible_line
+    )
+    {
+        to_line =
+            last_visible_line
+            -
+            1;
+    }
+
+
+    for (
+        u32 line = from_line;
+        line <= to_line;
+        line++
+    )
     {
         usize line_start =
-            editor_line_start_by_number(line);
+            editor_line_start_by_number(
+                line
+            );
+
 
         usize line_end =
-            editor_line_end_from_index(line_start);
+            editor_line_end_from_index(
+                line_start
+            );
 
-        usize segment_start = start;
-        usize segment_end = end;
 
-        if (segment_start < line_start)
-            segment_start = line_start;
+        usize segment_start =
+            start;
 
-        if (segment_end > line_end)
-            segment_end = line_end;
 
-        if (segment_start >= segment_end)
+        usize segment_end =
+            end;
+
+
+        if (
+            segment_start
+            <
+            line_start
+        )
+        {
+            segment_start =
+                line_start;
+        }
+
+
+        if (
+            segment_end
+            >
+            line_end
+        )
+        {
+            segment_end =
+                line_end;
+        }
+
+
+        if (
+            segment_start
+            >=
+            segment_end
+        )
+        {
             continue;
+        }
+
 
         u32 visual_start =
-            editor_visual_column(line_start, segment_start);
+            editor_visual_column(
+                line_start,
+                segment_start
+            );
+
 
         u32 visual_end =
-            editor_visual_column(line_start, segment_end);
+            editor_visual_column(
+                line_start,
+                segment_end
+            );
 
-        if (visual_end <= editor_horizontal_offset)
+
+        if (
+            visual_end
+            <=
+            editor_horizontal_offset
+        )
+        {
             continue;
+        }
 
-        if (visual_start < editor_horizontal_offset)
-            visual_start = editor_horizontal_offset;
+
+        if (
+            visual_start
+            <
+            editor_horizontal_offset
+        )
+        {
+            visual_start =
+                editor_horizontal_offset;
+        }
+
 
         u32 screen_start =
-            visual_start - editor_horizontal_offset;
+            visual_start
+            -
+            editor_horizontal_offset;
+
 
         u32 screen_end =
-            visual_end - editor_horizontal_offset;
+            visual_end
+            -
+            editor_horizontal_offset;
 
-        u32 columns = editor_columns();
 
-        if (screen_start >= columns)
+        u32 columns =
+            editor_columns();
+
+
+        if (
+            screen_start >= columns
+        )
+        {
             continue;
+        }
 
-        if (screen_end > columns)
-            screen_end = columns;
 
-        if (screen_end <= screen_start)
+        if (
+            screen_end > columns
+        )
+        {
+            screen_end =
+                columns;
+        }
+
+
+        if (
+            screen_end
+            <=
+            screen_start
+        )
+        {
             continue;
+        }
+
 
         u32 screen_row =
-            ROOTEDIT_BODY_START_ROW +
-            (line - editor_view_line);
+            ROOTEDIT_BODY_START_ROW
+            +
+            (
+                line
+                -
+                editor_view_line
+            );
+
 
         rootdisplay_invert_rect(
-            screen_start * ROOTEDIT_CELL_WIDTH,
-            screen_row * ROOTEDIT_CELL_HEIGHT,
-            (screen_end - screen_start) * ROOTEDIT_CELL_WIDTH,
+            screen_start
+            *
+            ROOTEDIT_CELL_WIDTH,
+
+            screen_row
+            *
+            ROOTEDIT_CELL_HEIGHT,
+
+            (
+                screen_end
+                -
+                screen_start
+            )
+            *
+            ROOTEDIT_CELL_WIDTH,
+
             ROOTEDIT_CELL_HEIGHT
         );
     }
+
+
+    rootdisplay_end_update();
 }
 
 
 static void editor_selection_hide(void)
 {
-    if (!selection_drawn)
-        return;
+    if (
+        selection_drawn
+    )
+    {
+        editor_toggle_selection_visual();
 
-    rootdisplay_begin_update();
-    editor_invert_selection_range(
-        selection_drawn_start,
-        selection_drawn_end
-    );
-    rootdisplay_end_update();
 
-    selection_drawn = false;
+        selection_drawn =
+            false;
+    }
 }
 
 
 static void editor_selection_show(void)
 {
     if (
-        !selection_active ||
-        editor_selection_start() == editor_selection_end()
+        selection_active
+        &&
+        editor_selection_start()
+        !=
+        editor_selection_end()
     )
     {
-        editor_selection_hide();
-        return;
+        editor_toggle_selection_visual();
+
+
+        selection_drawn =
+            true;
     }
-
-    usize new_start = editor_selection_start();
-    usize new_end = editor_selection_end();
-
-    rootdisplay_begin_update();
-
-    if (!selection_drawn)
-    {
-        editor_invert_selection_range(new_start, new_end);
-    }
-    else if (
-        new_end <= selection_drawn_start ||
-        new_start >= selection_drawn_end
-    )
-    {
-        /* Disjoint selection ranges. */
-        editor_invert_selection_range(
-            selection_drawn_start,
-            selection_drawn_end
-        );
-
-        editor_invert_selection_range(new_start, new_end);
-    }
-    else
-    {
-        /*
-         * Overlapping ranges: invert only the symmetric difference.
-         * Dragging by one character therefore touches one character,
-         * not the complete selection.
-         */
-        if (new_start < selection_drawn_start)
-        {
-            editor_invert_selection_range(
-                new_start,
-                selection_drawn_start
-            );
-        }
-        else if (new_start > selection_drawn_start)
-        {
-            editor_invert_selection_range(
-                selection_drawn_start,
-                new_start
-            );
-        }
-
-        if (new_end > selection_drawn_end)
-        {
-            editor_invert_selection_range(
-                selection_drawn_end,
-                new_end
-            );
-        }
-        else if (new_end < selection_drawn_end)
-        {
-            editor_invert_selection_range(
-                new_end,
-                selection_drawn_end
-            );
-        }
-    }
-
-    rootdisplay_end_update();
-
-    selection_drawn_start = new_start;
-    selection_drawn_end = new_end;
-    selection_drawn = true;
 }
 
 
@@ -1369,7 +1258,7 @@ static void editor_draw_header(void)
 
 
     terminal_print(
-        "Ctrl+S Save | Ctrl+Z Undo | Ctrl+C/X/V | Ctrl+Q Exit"
+        "Ctrl+S Save | Ctrl+Q Exit | Ctrl+C Copy | Ctrl+V Paste | Ctrl+K Cut"
     );
 
 
@@ -1399,30 +1288,51 @@ static void editor_draw_header(void)
 
 static void editor_draw_status(void)
 {
-    i32 status =
-        editor_save_error ? 2 :
-        (editor_dirty ? 1 : 0);
+    u32 row =
+        editor_rows()
+        -
+        1;
 
-    /*
-     * Selection changes happen at mouse-event frequency. They do not
-     * need to rewrite the status row. Only file-state changes do.
-     */
-    if (status == editor_status_cache)
-        return;
 
-    editor_status_cache = status;
+    editor_clear_row(
+        row
+    );
 
-    u32 row = editor_rows() - 1u;
 
-    editor_clear_row(row);
-    terminal_set_cursor(0, row);
+    if (
+        editor_save_error
+    )
+    {
+        terminal_print(
+            "[SAVE ERROR]"
+        );
+    }
 
-    if (editor_save_error)
-        terminal_print("[SAVE ERROR]");
-    else if (editor_dirty)
-        terminal_print("[MODIFIED]");
+    else if (
+        editor_dirty
+    )
+    {
+        terminal_print(
+            "[MODIFIED]"
+        );
+    }
+
     else
-        terminal_print("[SAVED]");
+    {
+        terminal_print(
+            "[SAVED]"
+        );
+    }
+
+
+    if (
+        selection_active
+    )
+    {
+        terminal_print(
+            " [SELECTION]"
+        );
+    }
 }
 
 
@@ -1440,16 +1350,17 @@ static void editor_redraw_full(void)
 
     selection_drawn =
         false;
-    selection_drawn_start = 0;
-    selection_drawn_end = 0;
 
 
-    terminal_begin_batch();
+    rootdisplay_begin_update();
+
 
     editor_draw_document();
+
     editor_draw_status();
 
-    terminal_end_batch();
+
+    rootdisplay_end_update();
 
 
     editor_selection_show();
@@ -1469,7 +1380,8 @@ static void editor_redraw_current_line(void)
     editor_selection_hide();
 
 
-    terminal_begin_batch();
+    rootdisplay_begin_update();
+
 
     editor_draw_line(
         editor_line_number_from_index(
@@ -1477,9 +1389,11 @@ static void editor_redraw_current_line(void)
         )
     );
 
+
     editor_draw_status();
 
-    terminal_end_batch();
+
+    rootdisplay_end_update();
 
 
     editor_selection_show();
@@ -1809,16 +1723,37 @@ static bool editor_delete(void)
 
 static void editor_copy_selection(void)
 {
-    if (!selection_active)
+    if (
+        !selection_active
+    )
+    {
         return;
+    }
 
-    usize start = editor_selection_start();
-    usize end = editor_selection_end();
 
-    rootclipboard_set(
-        &editor_buffer[start],
-        end - start
-    );
+    usize start =
+        editor_selection_start();
+
+
+    usize end =
+        editor_selection_end();
+
+
+    editor_clipboard_length =
+        end - start;
+
+
+    for (
+        usize i = 0;
+        i < editor_clipboard_length;
+        i++
+    )
+    {
+        editor_clipboard[i] =
+            editor_buffer[
+                start + i
+            ];
+    }
 }
 
 
@@ -1830,11 +1765,19 @@ static void editor_copy_selection(void)
 
 static bool editor_cut_selection(void)
 {
-    if (!selection_active)
+    if (
+        !selection_active
+    )
+    {
         return false;
+    }
+
 
     editor_copy_selection();
-    return editor_delete_selection();
+
+
+    return
+        editor_delete_selection();
 }
 
 
@@ -1846,44 +1789,93 @@ static bool editor_cut_selection(void)
 
 static bool editor_paste(void)
 {
-    const RootCodepoint* clipboard = rootclipboard_data();
-    usize clipboard_length = rootclipboard_length();
-
-    if (clipboard == NULL || clipboard_length == 0)
+    if (
+        editor_clipboard_length == 0
+    )
+    {
         return false;
+    }
 
-    bool structural = false;
 
-    if (selection_active)
-        structural = editor_delete_selection();
+    bool structural =
+        false;
+
 
     if (
-        editor_length + clipboard_length >
+        selection_active
+    )
+    {
+        structural =
+            editor_delete_selection();
+    }
+
+
+    if (
+        editor_length
+        +
+        editor_clipboard_length
+        >
         ROOTEDIT_MAX_CODEPOINTS
     )
     {
         return structural;
     }
 
-    for (usize i = editor_length; i > editor_cursor; i--)
+
+    for (
+        usize i = editor_length;
+        i > editor_cursor;
+        i--
+    )
     {
         editor_buffer[
-            i + clipboard_length - 1
-        ] = editor_buffer[i - 1];
+            i
+            +
+            editor_clipboard_length
+            -
+            1
+        ] =
+            editor_buffer[
+                i - 1
+            ];
     }
 
-    for (usize i = 0; i < clipboard_length; i++)
+
+    for (
+        usize i = 0;
+        i < editor_clipboard_length;
+        i++
+    )
     {
-        editor_buffer[editor_cursor + i] = clipboard[i];
+        editor_buffer[
+            editor_cursor + i
+        ] =
+            editor_clipboard[i];
 
-        if (clipboard[i] == '\n')
-            structural = true;
+
+        if (
+            editor_clipboard[i]
+            ==
+            '\n'
+        )
+        {
+            structural =
+                true;
+        }
     }
 
-    editor_cursor += clipboard_length;
-    editor_length += clipboard_length;
-    editor_dirty = true;
-    editor_save_error = false;
+
+    editor_cursor +=
+        editor_clipboard_length;
+
+
+    editor_length +=
+        editor_clipboard_length;
+
+
+    editor_dirty =
+        true;
+
 
     return structural;
 }
@@ -2141,96 +2133,6 @@ static bool editor_index_from_mouse(
 
 /*
  * ============================================================
- * DOUBLE CLICK -> WORD SELECTION
- * ============================================================
- */
-
-static bool editor_word_character(
-    RootCodepoint codepoint
-)
-{
-    if (
-        (codepoint >= 'a' && codepoint <= 'z') ||
-        (codepoint >= 'A' && codepoint <= 'Z') ||
-        (codepoint >= '0' && codepoint <= '9') ||
-        codepoint == '_' ||
-        codepoint >= 0x80
-    )
-    {
-        return true;
-    }
-
-    return false;
-}
-
-
-static bool editor_select_word_from_mouse(
-    i32 mouse_x,
-    i32 mouse_y
-)
-{
-    usize position;
-
-    if (!editor_index_from_mouse(mouse_x, mouse_y, &position))
-        return false;
-
-    if (position >= editor_length)
-        return false;
-
-    RootCodepoint clicked = editor_buffer[position];
-
-    if (clicked == '\n')
-        return false;
-
-    editor_selection_hide();
-
-    usize start = position;
-    usize end = position + 1;
-
-    bool word = editor_word_character(clicked);
-
-    while (start > 0)
-    {
-        RootCodepoint previous = editor_buffer[start - 1];
-
-        if (previous == '\n')
-            break;
-
-        if (editor_word_character(previous) != word)
-            break;
-
-        start--;
-    }
-
-    while (end < editor_length)
-    {
-        RootCodepoint next = editor_buffer[end];
-
-        if (next == '\n')
-            break;
-
-        if (editor_word_character(next) != word)
-            break;
-
-        end++;
-    }
-
-    selection_anchor = start;
-    editor_cursor = end;
-    selection_active = end > start;
-    mouse_selecting = false;
-
-    editor_ensure_cursor_visible();
-    editor_selection_show();
-    editor_place_cursor();
-    editor_break_undo_group();
-
-    return selection_active;
-}
-
-
-/*
- * ============================================================
  * LOAD
  * ============================================================
  */
@@ -2342,8 +2244,6 @@ static FsResult editor_load(
     editor_horizontal_offset =
         0;
 
-    editor_status_cache = -1;
-
 
     selection_active =
         false;
@@ -2357,11 +2257,8 @@ static FsResult editor_load(
         false;
 
 
-    undo_start = 0;
-    undo_count = 0;
-    redo_start = 0;
-    redo_count = 0;
-    undo_group = ROOTEDIT_GROUP_NONE;
+    editor_clipboard_length =
+        0;
 
 
     return
@@ -2516,443 +2413,789 @@ FsResult rootedit_open(
     terminal_clear();
 
 
-    terminal_begin_batch();
+    rootdisplay_begin_update();
+
 
     editor_draw_header();
+
     editor_draw_document();
+
     editor_draw_status();
 
-    terminal_end_batch();
+
+    rootdisplay_end_update();
 
 
     editor_place_cursor();
 
 
-    bool running = true;
+    bool running =
+        true;
 
-    while (running)
+
+    while (
+        running
+    )
     {
-        RootInputEvent event = rootinput_wait_event();
+        RootInputEvent event =
+            rootinput_wait_event();
 
-        /* ====================================================
-         * MOUSE
-         * ==================================================== */
 
-        if (
-            event.type == ROOT_INPUT_MOUSE_DOUBLE_CLICK &&
-            event.button == ROOT_MOUSE_LEFT
-        )
-        {
-            editor_select_word_from_mouse(
-                event.mouse_x,
-                event.mouse_y
-            );
-
-            continue;
-        }
+        /*
+         * ====================================================
+         * MOUSE BUTTON DOWN
+         * ====================================================
+         */
 
         if (
-            event.type == ROOT_INPUT_MOUSE_BUTTON_DOWN &&
-            event.button == ROOT_MOUSE_LEFT
+            event.type
+            ==
+            ROOT_INPUT_MOUSE_BUTTON_DOWN
+            &&
+            event.button
+            ==
+            ROOT_MOUSE_LEFT
         )
         {
             usize index;
 
-            if (editor_index_from_mouse(
-                event.mouse_x,
-                event.mouse_y,
-                &index
-            ))
+
+            if (
+                editor_index_from_mouse(
+                    event.mouse_x,
+                    event.mouse_y,
+                    &index
+                )
+            )
             {
                 editor_selection_hide();
-                editor_cursor = index;
-                selection_anchor = index;
-                selection_active = false;
-                mouse_selecting = true;
-                editor_break_undo_group();
+
+
+                editor_cursor =
+                    index;
+
+
+                selection_anchor =
+                    index;
+
+
+                selection_active =
+                    false;
+
+
+                mouse_selecting =
+                    true;
+
+
                 editor_after_cursor_move();
             }
+
 
             continue;
         }
 
+
+        /*
+         * ====================================================
+         * MOUSE DRAG = SELECT
+         * ====================================================
+         */
+
         if (
-            event.type == ROOT_INPUT_MOUSE_DRAG &&
+            event.type
+            ==
+            ROOT_INPUT_MOUSE_DRAG
+            &&
             mouse_selecting
         )
         {
             usize index;
 
-            if (editor_index_from_mouse(
-                event.mouse_x,
-                event.mouse_y,
-                &index
-            ))
+
+            if (
+                editor_index_from_mouse(
+                    event.mouse_x,
+                    event.mouse_y,
+                    &index
+                )
+            )
             {
-                editor_cursor = index;
-                selection_active = editor_cursor != selection_anchor;
+                editor_selection_hide();
 
-                bool viewport_changed = editor_ensure_cursor_visible();
 
-                if (viewport_changed)
-                    editor_redraw_full();
-                else
-                {
-                    editor_selection_show();
-                    editor_place_cursor();
-                }
-            }
+                editor_cursor =
+                    index;
 
-            continue;
-        }
 
-        if (
-            event.type == ROOT_INPUT_MOUSE_BUTTON_UP &&
-            event.button == ROOT_MOUSE_LEFT
-        )
-        {
-            mouse_selecting = false;
-            continue;
-        }
+                selection_active =
+                    editor_cursor
+                    !=
+                    selection_anchor;
 
-        if (event.type != ROOT_INPUT_KEY_DOWN)
-            continue;
 
-        /* ====================================================
-         * STANDARD CTRL ACTIONS
-         * ==================================================== */
-
-        RootTextAction action = roottext_editor_action(&event);
-
-        if (action == ROOT_TEXT_ACTION_SAVE)
-        {
-            editor_break_undo_group();
-            editor_save();
-
-            terminal_begin_batch();
-            editor_draw_status();
-            terminal_end_batch();
-            editor_place_cursor();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_EXIT)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-            running = false;
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_SELECT_ALL)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-
-            selection_anchor = 0;
-            editor_cursor = editor_length;
-            selection_active = editor_length != 0;
-
-            editor_ensure_cursor_visible();
-            editor_redraw_full();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_COPY)
-        {
-            editor_break_undo_group();
-            editor_copy_selection();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_CUT)
-        {
-            editor_break_undo_group();
-
-            if (selection_active)
-            {
-                editor_record_undo(ROOTEDIT_GROUP_NONE, true);
-                bool structural = editor_cut_selection();
-                bool viewport_changed = editor_ensure_cursor_visible();
-
-                if (structural || viewport_changed)
-                    editor_redraw_full();
-                else
-                    editor_redraw_current_line();
-            }
-
-            editor_break_undo_group();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_PASTE)
-        {
-            editor_break_undo_group();
-
-            if (!rootclipboard_empty())
-            {
-                editor_record_undo(ROOTEDIT_GROUP_NONE, true);
-                bool structural = editor_paste();
-                bool viewport_changed = editor_ensure_cursor_visible();
-
-                if (structural || viewport_changed)
-                    editor_redraw_full();
-                else
-                    editor_redraw_current_line();
-            }
-
-            editor_break_undo_group();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_UNDO)
-        {
-            editor_selection_hide();
-
-            if (editor_undo())
-            {
                 editor_ensure_cursor_visible();
-                editor_redraw_full();
+
+
+                editor_selection_show();
+
+                editor_place_cursor();
             }
+
 
             continue;
         }
 
-        if (action == ROOT_TEXT_ACTION_REDO)
-        {
-            editor_selection_hide();
-
-            if (editor_redo())
-            {
-                editor_ensure_cursor_visible();
-                editor_redraw_full();
-            }
-
-            continue;
-        }
 
         /*
-         * Any other Ctrl/Alt combination is a command modifier,
-         * never ordinary text. Unknown shortcuts are ignored.
+         * ====================================================
+         * MOUSE BUTTON UP
+         * ====================================================
          */
-        if (event.ctrl || (event.alt && !event.altgr))
+
+        if (
+            event.type
+            ==
+            ROOT_INPUT_MOUSE_BUTTON_UP
+            &&
+            event.button
+            ==
+            ROOT_MOUSE_LEFT
+        )
         {
-            editor_break_undo_group();
+            mouse_selecting =
+                false;
+
+
             continue;
         }
 
-        /* ====================================================
-         * SHIFT + ARROWS = SELECTION
-         * ==================================================== */
+
+        /*
+         * Ignorar movimientos normales.
+         */
 
         if (
-            event.shift &&
+            event.type
+            !=
+            ROOT_INPUT_KEY_DOWN
+        )
+        {
+            continue;
+        }
+
+
+        /*
+         * ====================================================
+         * CTRL COMMANDS
+         * ====================================================
+         */
+
+        if (
+            event.ctrl
+        )
+        {
+            /*
+             * Ctrl+S = save
+             */
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_S
+            )
+            {
+                editor_save();
+
+
+                rootdisplay_begin_update();
+
+                editor_draw_status();
+
+                rootdisplay_end_update();
+
+
+                editor_place_cursor();
+
+
+                continue;
+            }
+
+
+            /*
+             * Ctrl+Q = exit
+             */
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_Q
+            )
+            {
+                editor_selection_hide();
+
+
+                running =
+                    false;
+
+
+                continue;
+            }
+
+
+            /*
+             * Ctrl+A = select all
+             */
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_A
+            )
+            {
+                editor_selection_hide();
+
+
+                selection_anchor =
+                    0;
+
+
+                editor_cursor =
+                    editor_length;
+
+
+                selection_active =
+                    editor_length != 0;
+
+
+                editor_ensure_cursor_visible();
+
+                editor_redraw_full();
+
+
+                continue;
+            }
+
+
+            /*
+             * Ctrl+C = copy
+             */
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_C
+            )
+            {
+                editor_copy_selection();
+
+
+                continue;
+            }
+
+
+            /*
+             * Ctrl+K = cut
+             */
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_K
+            )
+            {
+                bool structural =
+                    editor_cut_selection();
+
+
+                editor_ensure_cursor_visible();
+
+
+                if (
+                    structural
+                )
+                {
+                    editor_redraw_full();
+                }
+
+                else
+                {
+                    editor_redraw_current_line();
+                }
+
+
+                continue;
+            }
+
+
+            /*
+             * Ctrl+V = paste
+             */
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_V
+            )
+            {
+                bool structural =
+                    editor_paste();
+
+
+                bool viewport_changed =
+                    editor_ensure_cursor_visible();
+
+
+                if (
+                    structural
+                    ||
+                    viewport_changed
+                )
+                {
+                    editor_redraw_full();
+                }
+
+                else
+                {
+                    editor_redraw_current_line();
+                }
+
+
+                continue;
+            }
+        }
+
+
+        /*
+         * ====================================================
+         * SHIFT + ARROWS = SELECTION
+         * ====================================================
+         */
+
+        if (
+            event.shift
+            &&
             (
-                event.key == ROOT_KEY_LEFT ||
-                event.key == ROOT_KEY_RIGHT ||
-                event.key == ROOT_KEY_UP ||
+                event.key == ROOT_KEY_LEFT
+                ||
+                event.key == ROOT_KEY_RIGHT
+                ||
+                event.key == ROOT_KEY_UP
+                ||
                 event.key == ROOT_KEY_DOWN
             )
         )
         {
-            editor_break_undo_group();
+            editor_selection_hide();
 
-            if (!selection_active)
-                selection_anchor = editor_cursor;
 
-            if (event.key == ROOT_KEY_LEFT && editor_cursor > 0)
+            if (
+                !selection_active
+            )
+            {
+                selection_anchor =
+                    editor_cursor;
+            }
+
+
+            if (
+                event.key == ROOT_KEY_LEFT
+                &&
+                editor_cursor > 0
+            )
+            {
                 editor_cursor--;
+            }
 
-            if (event.key == ROOT_KEY_RIGHT && editor_cursor < editor_length)
+
+            if (
+                event.key == ROOT_KEY_RIGHT
+                &&
+                editor_cursor < editor_length
+            )
+            {
                 editor_cursor++;
+            }
 
-            if (event.key == ROOT_KEY_UP)
+
+            if (
+                event.key == ROOT_KEY_UP
+            )
+            {
                 editor_move_up();
+            }
 
-            if (event.key == ROOT_KEY_DOWN)
+
+            if (
+                event.key == ROOT_KEY_DOWN
+            )
+            {
                 editor_move_down();
+            }
 
-            selection_active = editor_cursor != selection_anchor;
 
-            bool viewport_changed = editor_ensure_cursor_visible();
+            selection_active =
+                editor_cursor
+                !=
+                selection_anchor;
 
-            if (viewport_changed)
+
+            bool viewport_changed =
+                editor_ensure_cursor_visible();
+
+
+            if (
+                viewport_changed
+            )
+            {
                 editor_redraw_full();
+            }
+
             else
             {
                 editor_selection_show();
+
                 editor_place_cursor();
             }
 
+
             continue;
         }
 
-        /* ====================================================
+
+        /*
+         * ====================================================
          * NORMAL CURSOR MOVEMENT
-         * ==================================================== */
-
-        if (event.key == ROOT_KEY_LEFT)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-            editor_selection_clear();
-
-            if (editor_cursor > 0)
-                editor_cursor--;
-
-            editor_after_cursor_move();
-            continue;
-        }
-
-        if (event.key == ROOT_KEY_RIGHT)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-            editor_selection_clear();
-
-            if (editor_cursor < editor_length)
-                editor_cursor++;
-
-            editor_after_cursor_move();
-            continue;
-        }
-
-        if (event.key == ROOT_KEY_UP)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-            editor_selection_clear();
-            editor_move_up();
-            editor_after_cursor_move();
-            continue;
-        }
-
-        if (event.key == ROOT_KEY_DOWN)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-            editor_selection_clear();
-            editor_move_down();
-            editor_after_cursor_move();
-            continue;
-        }
-
-        if (event.key == ROOT_KEY_HOME)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-            editor_selection_clear();
-            editor_cursor = editor_line_start_from_index(editor_cursor);
-            editor_after_cursor_move();
-            continue;
-        }
-
-        if (event.key == ROOT_KEY_END)
-        {
-            editor_break_undo_group();
-            editor_selection_hide();
-            editor_selection_clear();
-            editor_cursor = editor_line_end_from_index(editor_cursor);
-            editor_after_cursor_move();
-            continue;
-        }
-
-        /* ====================================================
-         * DELETE / INSERT
-         * ==================================================== */
-
-        if (event.key == ROOT_KEY_BACKSPACE)
-        {
-            bool had_selection = selection_active;
-            editor_record_undo(ROOTEDIT_GROUP_BACKSPACE, had_selection);
-
-            bool structural = editor_backspace();
-            bool viewport_changed = editor_ensure_cursor_visible();
-
-            if (structural || viewport_changed)
-                editor_redraw_full();
-            else
-                editor_redraw_current_line();
-
-            if (had_selection)
-                editor_break_undo_group();
-
-            continue;
-        }
-
-        if (event.key == ROOT_KEY_DELETE)
-        {
-            bool had_selection = selection_active;
-            editor_record_undo(ROOTEDIT_GROUP_DELETE, had_selection);
-
-            bool structural = editor_delete();
-            bool viewport_changed = editor_ensure_cursor_visible();
-
-            if (structural || viewport_changed)
-                editor_redraw_full();
-            else
-                editor_redraw_current_line();
-
-            if (had_selection)
-                editor_break_undo_group();
-
-            continue;
-        }
+         * ====================================================
+         */
 
         if (
-            event.key == ROOT_KEY_ENTER ||
+            event.key == ROOT_KEY_LEFT
+        )
+        {
+            editor_selection_hide();
+
+            editor_selection_clear();
+
+
+            if (
+                editor_cursor > 0
+            )
+            {
+                editor_cursor--;
+            }
+
+
+            editor_after_cursor_move();
+
+            continue;
+        }
+
+
+        if (
+            event.key == ROOT_KEY_RIGHT
+        )
+        {
+            editor_selection_hide();
+
+            editor_selection_clear();
+
+
+            if (
+                editor_cursor < editor_length
+            )
+            {
+                editor_cursor++;
+            }
+
+
+            editor_after_cursor_move();
+
+            continue;
+        }
+
+
+        if (
+            event.key == ROOT_KEY_UP
+        )
+        {
+            editor_selection_hide();
+
+            editor_selection_clear();
+
+
+            editor_move_up();
+
+            editor_after_cursor_move();
+
+            continue;
+        }
+
+
+        if (
+            event.key == ROOT_KEY_DOWN
+        )
+        {
+            editor_selection_hide();
+
+            editor_selection_clear();
+
+
+            editor_move_down();
+
+            editor_after_cursor_move();
+
+            continue;
+        }
+
+
+        if (
+            event.key == ROOT_KEY_HOME
+        )
+        {
+            editor_selection_hide();
+
+            editor_selection_clear();
+
+
+            editor_cursor =
+                editor_line_start_from_index(
+                    editor_cursor
+                );
+
+
+            editor_after_cursor_move();
+
+            continue;
+        }
+
+
+        if (
+            event.key == ROOT_KEY_END
+        )
+        {
+            editor_selection_hide();
+
+            editor_selection_clear();
+
+
+            editor_cursor =
+                editor_line_end_from_index(
+                    editor_cursor
+                );
+
+
+            editor_after_cursor_move();
+
+            continue;
+        }
+
+
+        /*
+         * ====================================================
+         * BACKSPACE
+         * ====================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_BACKSPACE
+        )
+        {
+            bool structural =
+                editor_backspace();
+
+
+            bool viewport_changed =
+                editor_ensure_cursor_visible();
+
+
+            if (
+                structural
+                ||
+                viewport_changed
+            )
+            {
+                editor_redraw_full();
+            }
+
+            else
+            {
+                editor_redraw_current_line();
+            }
+
+
+            continue;
+        }
+
+
+        /*
+         * ====================================================
+         * DELETE
+         * ====================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_DELETE
+        )
+        {
+            bool structural =
+                editor_delete();
+
+
+            bool viewport_changed =
+                editor_ensure_cursor_visible();
+
+
+            if (
+                structural
+                ||
+                viewport_changed
+            )
+            {
+                editor_redraw_full();
+            }
+
+            else
+            {
+                editor_redraw_current_line();
+            }
+
+
+            continue;
+        }
+
+
+        /*
+         * ====================================================
+         * ENTER
+         * ====================================================
+         */
+
+        if (
+            event.key == ROOT_KEY_ENTER
+            ||
             event.key == ROOT_KEY_KP_ENTER
         )
         {
-            editor_break_undo_group();
-            editor_record_undo(ROOTEDIT_GROUP_NONE, true);
-            editor_insert('\n');
-            editor_break_undo_group();
+            editor_insert(
+                '\n'
+            );
+
 
             editor_ensure_cursor_visible();
+
             editor_redraw_full();
-            continue;
-        }
 
-        if (event.key == ROOT_KEY_TAB)
-        {
-            editor_break_undo_group();
-            editor_record_undo(ROOTEDIT_GROUP_NONE, true);
-
-            for (u32 i = 0; i < 4; i++)
-                editor_insert(' ');
-
-            editor_break_undo_group();
-
-            bool viewport_changed = editor_ensure_cursor_visible();
-
-            if (viewport_changed)
-                editor_redraw_full();
-            else
-                editor_redraw_current_line();
 
             continue;
         }
 
-        if (roottext_should_insert(&event))
+
+        /*
+         * ====================================================
+         * TAB
+         * ====================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_TAB
+        )
         {
-            bool had_selection = selection_active;
-            editor_record_undo(ROOTEDIT_GROUP_INSERT, had_selection);
+            bool structural =
+                false;
 
-            bool structural = editor_insert(event.codepoint);
-            bool viewport_changed = editor_ensure_cursor_visible();
 
-            if (structural || viewport_changed)
+            for (
+                u32 i = 0;
+                i < 4;
+                i++
+            )
+            {
+                if (
+                    editor_insert(' ')
+                )
+                {
+                    structural =
+                        true;
+                }
+            }
+
+
+            bool viewport_changed =
+                editor_ensure_cursor_visible();
+
+
+            if (
+                structural
+                ||
+                viewport_changed
+            )
+            {
                 editor_redraw_full();
-            else
-                editor_redraw_current_line();
+            }
 
-            if (had_selection)
-                editor_break_undo_group();
+            else
+            {
+                editor_redraw_current_line();
+            }
+
+
+            continue;
+        }
+
+
+        /*
+         * ====================================================
+         * TEXT
+         * ====================================================
+         */
+
+        if (
+            event.codepoint != 0
+        )
+        {
+            bool structural =
+                editor_insert(
+                    event.codepoint
+                );
+
+
+            bool viewport_changed =
+                editor_ensure_cursor_visible();
+
+
+            /*
+             * Caso normal:
+             *
+             * UNA tecla
+             *      ↓
+             * UNA sola línea redibujada.
+             */
+
+            if (
+                structural
+                ||
+                viewport_changed
+            )
+            {
+                editor_redraw_full();
+            }
+
+            else
+            {
+                editor_redraw_current_line();
+            }
+
 
             continue;
         }
     }
+
 
     terminal_clear();
 

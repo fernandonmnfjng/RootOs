@@ -19,7 +19,6 @@
 #define TERMINAL_MAX_COLS 256u
 #define TERMINAL_MAX_ROWS 128u
 #define TERMINAL_SCROLLBACK_LINES 256u
-#define TERMINAL_OUTPUT_DEFER_THRESHOLD 192u
 
 #define TERMINAL_CONTINUATION 0xFFFFFFFFu
 
@@ -61,12 +60,6 @@ static u32 scrollback_view_offset = 0;
 /* One render transaction can contain many characters. */
 static u32 terminal_update_depth = 0;
 
-/* Explicit batches are used by RootEdit and shell command output. */
-static u32 terminal_explicit_batch_depth = 0;
-static usize terminal_batch_output_count = 0;
-static usize terminal_batch_defer_threshold = 0;
-static bool terminal_full_redraw_pending = false;
-
 /* ============================================================
  * TERMINAL SELECTION
  * ============================================================ */
@@ -74,8 +67,6 @@ static bool terminal_full_redraw_pending = false;
 static bool selection_tracking = false;
 static bool selection_active_state = false;
 static bool selection_drawn = false;
-static u32 selection_drawn_start = 0;
-static u32 selection_drawn_end = 0;
 
 static u32 selection_anchor_col = 0;
 static u32 selection_anchor_row = 0;
@@ -156,17 +147,25 @@ static void graphics_draw_glyph_pixels(
     if (!graphics_get_glyph(codepoint, &glyph))
         return;
 
-    rootdisplay_draw_mono_bitmap(
-        column * TERMINAL_CELL_WIDTH,
-        row * TERMINAL_CELL_HEIGHT,
-        glyph.width,
-        TERMINAL_CELL_HEIGHT,
-        glyph.bitmap,
-        2u,
-        terminal_foreground,
-        terminal_background,
-        false
-    );
+    u32 pixel_width = glyph.width;
+
+    for (u32 y = 0; y < 16; y++)
+    {
+        for (u32 x = 0; x < pixel_width; x++)
+        {
+            u32 byte_index = y * 2u + x / 8u;
+            u8 bit = (u8)(7u - (x % 8u));
+
+            if ((glyph.bitmap[byte_index] & (1u << bit)) == 0)
+                continue;
+
+            rootdisplay_put_pixel(
+                column * TERMINAL_CELL_WIDTH + x,
+                row * TERMINAL_CELL_HEIGHT + y,
+                terminal_foreground
+            );
+        }
+    }
 }
 
 static void graphics_draw_glyph(
@@ -183,17 +182,15 @@ static void graphics_draw_glyph(
         return;
     }
 
-    rootdisplay_draw_mono_bitmap(
+    rootdisplay_fill_rect(
         column * TERMINAL_CELL_WIDTH,
         row * TERMINAL_CELL_HEIGHT,
         glyph.width,
         TERMINAL_CELL_HEIGHT,
-        glyph.bitmap,
-        2u,
-        terminal_foreground,
-        terminal_background,
-        true
+        terminal_background
     );
+
+    graphics_draw_glyph_pixels(codepoint, column, row);
 }
 
 static void graphics_render_live_cell(u32 column, u32 row)
@@ -275,7 +272,14 @@ static void graphics_render_row_data(
     u32 screen_row
 )
 {
-    /* graphics_redraw_view() already cleared the whole framebuffer. */
+    rootdisplay_fill_rect(
+        0,
+        screen_row * TERMINAL_CELL_HEIGHT,
+        terminal_cols * TERMINAL_CELL_WIDTH,
+        TERMINAL_CELL_HEIGHT,
+        terminal_background
+    );
+
     if (row_data == NULL)
         return;
 
@@ -387,50 +391,15 @@ static void selection_bounds(
     }
 }
 
-static void selection_invert_linear_range(
-    u32 first,
-    u32 last
-)
+static void selection_toggle_visual(void)
 {
-    if (!terminal_graphics || first > last)
-        return;
-
-    u32 max_cell = terminal_rows * terminal_cols;
-    if (max_cell == 0)
-        return;
-
-    max_cell--;
-
-    if (first > max_cell)
-        return;
-
-    if (last > max_cell)
-        last = max_cell;
-
-    u32 first_row = first / terminal_cols;
-    u32 last_row = last / terminal_cols;
-
-    for (u32 row = first_row; row <= last_row; row++)
+    if (
+        !terminal_graphics ||
+        !selection_active_state
+    )
     {
-        u32 from = row == first_row ? first % terminal_cols : 0;
-        u32 to = row == last_row ? last % terminal_cols : terminal_cols - 1u;
-
-        rootdisplay_invert_rect(
-            from * TERMINAL_CELL_WIDTH,
-            row * TERMINAL_CELL_HEIGHT,
-            (to - from + 1u) * TERMINAL_CELL_WIDTH,
-            TERMINAL_CELL_HEIGHT
-        );
+        return;
     }
-}
-
-static bool selection_current_linear(
-    u32* start,
-    u32* end
-)
-{
-    if (!selection_active_state || start == NULL || end == NULL)
-        return false;
 
     u32 start_col;
     u32 start_row;
@@ -444,9 +413,25 @@ static bool selection_current_linear(
         &end_row
     );
 
-    *start = cell_linear(start_col, start_row);
-    *end = cell_linear(end_col, end_row);
-    return true;
+    rootdisplay_begin_update();
+
+    for (u32 row = start_row; row <= end_row; row++)
+    {
+        u32 from = row == start_row ? start_col : 0;
+        u32 to = row == end_row ? end_col : terminal_cols - 1;
+
+        if (to < from)
+            continue;
+
+        rootdisplay_invert_rect(
+            from * TERMINAL_CELL_WIDTH,
+            row * TERMINAL_CELL_HEIGHT,
+            (to - from + 1u) * TERMINAL_CELL_WIDTH,
+            TERMINAL_CELL_HEIGHT
+        );
+    }
+
+    rootdisplay_end_update();
 }
 
 static void selection_hide(void)
@@ -454,86 +439,16 @@ static void selection_hide(void)
     if (!selection_drawn)
         return;
 
-    rootdisplay_begin_update();
-    selection_invert_linear_range(
-        selection_drawn_start,
-        selection_drawn_end
-    );
-    rootdisplay_end_update();
-
+    selection_toggle_visual();
     selection_drawn = false;
 }
 
 static void selection_show(void)
 {
-    u32 new_start;
-    u32 new_end;
-
-    if (!selection_current_linear(&new_start, &new_end))
-    {
-        selection_hide();
+    if (!selection_active_state || selection_drawn)
         return;
-    }
 
-    rootdisplay_begin_update();
-
-    if (!selection_drawn)
-    {
-        selection_invert_linear_range(new_start, new_end);
-    }
-    else if (
-        new_end < selection_drawn_start ||
-        new_start > selection_drawn_end
-    )
-    {
-        /* Disjoint ranges: old disappears, new appears. */
-        selection_invert_linear_range(
-            selection_drawn_start,
-            selection_drawn_end
-        );
-        selection_invert_linear_range(new_start, new_end);
-    }
-    else
-    {
-        /*
-         * Ranges overlap. Invert only their symmetric difference,
-         * i.e. the edge cells that actually changed while dragging.
-         */
-        if (new_start < selection_drawn_start)
-        {
-            selection_invert_linear_range(
-                new_start,
-                selection_drawn_start - 1u
-            );
-        }
-        else if (new_start > selection_drawn_start)
-        {
-            selection_invert_linear_range(
-                selection_drawn_start,
-                new_start - 1u
-            );
-        }
-
-        if (new_end > selection_drawn_end)
-        {
-            selection_invert_linear_range(
-                selection_drawn_end + 1u,
-                new_end
-            );
-        }
-        else if (new_end < selection_drawn_end)
-        {
-            selection_invert_linear_range(
-                new_end + 1u,
-                selection_drawn_end
-            );
-        }
-    }
-
-    rootdisplay_end_update();
-
-    selection_drawn_start = new_start;
-    selection_drawn_end = new_end;
+    selection_toggle_visual();
     selection_drawn = true;
 }
 
@@ -596,58 +511,11 @@ static void terminal_end_update(void)
 
 void terminal_begin_batch(void)
 {
-    if (terminal_explicit_batch_depth == 0)
-    {
-        terminal_batch_output_count = 0;
-        terminal_batch_defer_threshold = 0;
-    }
-
-    terminal_explicit_batch_depth++;
-    terminal_begin_update(false);
-}
-
-void terminal_begin_output_batch(void)
-{
-    if (terminal_explicit_batch_depth == 0)
-    {
-        terminal_batch_output_count = 0;
-        terminal_batch_defer_threshold =
-            TERMINAL_OUTPUT_DEFER_THRESHOLD;
-    }
-
-    terminal_explicit_batch_depth++;
     terminal_begin_update(false);
 }
 
 void terminal_end_batch(void)
 {
-    if (terminal_explicit_batch_depth == 0)
-        return;
-
-    bool outermost = terminal_explicit_batch_depth == 1;
-    terminal_explicit_batch_depth--;
-
-    if (
-        outermost &&
-        terminal_graphics &&
-        terminal_full_redraw_pending
-    )
-    {
-        /*
-         * Large output and multi-line scrolls update the logical
-         * terminal immediately but defer expensive raster work.
-         * Render the final viewport once here.
-         */
-        graphics_redraw_view();
-        terminal_full_redraw_pending = false;
-    }
-
-    if (outermost)
-    {
-        terminal_batch_output_count = 0;
-        terminal_batch_defer_threshold = 0;
-    }
-
     terminal_end_update();
 }
 
@@ -678,17 +546,7 @@ static void terminal_scroll(void)
 
         terminal_row = terminal_rows - 1;
 
-        if (terminal_explicit_batch_depth != 0)
-        {
-            /*
-             * Do not move several megabytes of framebuffer for every
-             * newline produced by a large command. The final screen is
-             * rasterized once when the explicit batch ends.
-             */
-            terminal_full_redraw_pending = true;
-            return;
-        }
-
+        /* Pixel scroll instead of rasterizing the full terminal. */
         rootdisplay_scroll_up(
             TERMINAL_CELL_HEIGHT,
             terminal_background
@@ -730,10 +588,6 @@ void terminal_init(void)
     selection_drawn = false;
 
     terminal_update_depth = 0;
-    terminal_explicit_batch_depth = 0;
-    terminal_batch_output_count = 0;
-    terminal_batch_defer_threshold = 0;
-    terminal_full_redraw_pending = false;
 
     terminal_graphics =
         rootdisplay_ready() && rootfont_ready();
@@ -774,7 +628,6 @@ void terminal_clear(void)
     terminal_row = 0;
     terminal_col = 0;
     scrollback_view_offset = 0;
-    terminal_full_redraw_pending = false;
 
     if (terminal_graphics)
     {
@@ -833,19 +686,6 @@ void terminal_clear_row(u32 row)
 
 static void terminal_putcodepoint_internal(RootCodepoint codepoint)
 {
-    if (terminal_explicit_batch_depth != 0)
-    {
-        terminal_batch_output_count++;
-
-        if (
-            terminal_batch_defer_threshold != 0 &&
-            terminal_batch_output_count >= terminal_batch_defer_threshold
-        )
-        {
-            terminal_full_redraw_pending = true;
-        }
-    }
-
     if (codepoint == '\n')
     {
         terminal_col = 0;
@@ -877,10 +717,7 @@ static void terminal_putcodepoint_internal(RootCodepoint codepoint)
         terminal_cells[terminal_row][terminal_col] = ' ';
 
         if (terminal_graphics)
-        {
-            if (!terminal_full_redraw_pending)
-                graphics_render_live_cell(terminal_col, terminal_row);
-        }
+            graphics_render_live_cell(terminal_col, terminal_row);
         else
             vga_put_at(' ', terminal_col, terminal_row);
 
@@ -910,9 +747,7 @@ static void terminal_putcodepoint_internal(RootCodepoint codepoint)
         )
         {
             terminal_cells[terminal_row][terminal_col - 1] = ' ';
-
-            if (!terminal_full_redraw_pending)
-                graphics_render_live_cell(terminal_col - 1, terminal_row);
+            graphics_render_live_cell(terminal_col - 1, terminal_row);
         }
 
         /* If replacing a wide glyph with narrow text, clear its continuation. */
@@ -925,9 +760,7 @@ static void terminal_putcodepoint_internal(RootCodepoint codepoint)
         )
         {
             terminal_cells[terminal_row][terminal_col + 1] = ' ';
-
-            if (!terminal_full_redraw_pending)
-                graphics_clear_cell(terminal_col + 1, terminal_row);
+            graphics_clear_cell(terminal_col + 1, terminal_row);
         }
 
         terminal_cells[terminal_row][terminal_col] = codepoint;
@@ -935,8 +768,7 @@ static void terminal_putcodepoint_internal(RootCodepoint codepoint)
         if (cells_needed == 2 && terminal_col + 1 < terminal_cols)
             terminal_cells[terminal_row][terminal_col + 1] = TERMINAL_CONTINUATION;
 
-        if (!terminal_full_redraw_pending)
-            graphics_draw_glyph(codepoint, terminal_col, terminal_row);
+        graphics_draw_glyph(codepoint, terminal_col, terminal_row);
 
         terminal_col += cells_needed;
 
@@ -1132,13 +964,12 @@ bool terminal_selection_drag(i32 pixel_x, i32 pixel_y)
         return true;
     }
 
+    selection_hide();
+
     selection_focus_col = column;
     selection_focus_row = row;
-    selection_active_state =
-        column != selection_anchor_col ||
-        row != selection_anchor_row;
+    selection_active_state = true;
 
-    /* selection_show() now applies only the changed edge cells. */
     selection_show();
     return true;
 }

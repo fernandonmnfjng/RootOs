@@ -2,8 +2,6 @@
 
 #include "terminal.h"
 #include "rootinput.h"
-#include "rootclipboard.h"
-#include "roottext.h"
 #include "rootedit.h"
 
 #include "unicode.h"
@@ -2243,77 +2241,93 @@ static void shell_history_next(void)
  * ============================================================
  */
 
-static bool shell_insert_codepoint_raw(
-    RootCodepoint codepoint
-)
-{
-    if (!root_unicode_valid(codepoint))
-        return false;
-
-    if (command_length >= COMMAND_BUFFER_SIZE - 1)
-        return false;
-
-    u32 needed = terminal_codepoint_cells(codepoint);
-    u32 total = shell_total_cells();
-    u32 columns = terminal_get_columns();
-
-    /* Shell input is intentionally one visual line for now. */
-    if (
-        input_start_col + total + needed >= columns
-    )
-    {
-        return false;
-    }
-
-    for (u32 i = command_length; i > command_cursor; i--)
-        command_buffer[i] = command_buffer[i - 1];
-
-    command_buffer[command_cursor] = codepoint;
-    command_cursor++;
-    command_length++;
-    command_buffer[command_length] = 0;
-    return true;
-}
-
-
 static void shell_insert_codepoint(
     RootCodepoint codepoint
 )
 {
-    if (shell_insert_codepoint_raw(codepoint))
-        shell_redraw_line();
-}
-
-
-static void shell_paste_clipboard(void)
-{
-    const RootCodepoint* data = rootclipboard_data();
-    usize length = rootclipboard_length();
-
-    if (data == NULL || length == 0)
+    if (
+        !root_unicode_valid(
+            codepoint
+        )
+    )
+    {
         return;
-
-    bool changed = false;
-
-    for (usize i = 0; i < length; i++)
-    {
-        RootCodepoint codepoint = data[i];
-
-        /* Current shell editor is single-line. */
-        if (codepoint == '\n' || codepoint == '\r')
-            codepoint = ' ';
-
-        if (!shell_insert_codepoint_raw(codepoint))
-            break;
-
-        changed = true;
     }
 
-    if (changed)
+
+    if (
+        command_length
+        >=
+        COMMAND_BUFFER_SIZE - 1
+    )
     {
-        command_history_position = -1;
-        shell_redraw_line();
+        return;
     }
+
+
+    u32 needed =
+        terminal_codepoint_cells(
+            codepoint
+        );
+
+
+    u32 total =
+        shell_total_cells();
+
+
+    u32 columns =
+        terminal_get_columns();
+
+
+    /*
+     * Por ahora:
+     * editor de una sola línea.
+     */
+    if (
+        input_start_col
+        +
+        total
+        +
+        needed
+        >=
+        columns
+    )
+    {
+        return;
+    }
+
+
+    for (
+        u32 i = command_length;
+        i > command_cursor;
+        i--
+    )
+    {
+        command_buffer[i] =
+            command_buffer[
+                i - 1
+            ];
+    }
+
+
+    command_buffer[
+        command_cursor
+    ] =
+        codepoint;
+
+
+    command_cursor++;
+
+    command_length++;
+
+
+    command_buffer[
+        command_length
+    ] =
+        0;
+
+
+    shell_redraw_line();
 }
 
 
@@ -2606,35 +2620,6 @@ static void shell_mouse_click(
 
 /*
  * ============================================================
- * COMMAND OUTPUT BATCHING
- * ============================================================
- *
- * Most commands return to the shell immediately and can render their
- * output as one transaction. Full-screen/terminal-owning commands must
- * remain live while they run.
- */
-static bool shell_command_can_batch(
-    const char* command
-)
-{
-    if (command == NULL)
-        return false;
-
-    if (
-        root_streq(command, "reboot") ||
-        root_streq(command, "shutdown") ||
-        root_streq(command, "editfile") ||
-        root_starts_with(command, "editfile ")
-    )
-    {
-        return false;
-    }
-
-    return true;
-}
-
-/*
- * ============================================================
  * SHELL LOOP
  * ============================================================
  */
@@ -2642,308 +2627,430 @@ static bool shell_command_can_batch(
 void shell_run(void)
 {
     command_length = 0;
+
     command_cursor = 0;
+
     rendered_length = 0;
+
     command_buffer[0] = 0;
 
+
     command_history_count = 0;
+
     command_history_position = -1;
+
 
     shell_prompt();
 
+
     while (1)
     {
-        RootInputEvent event = rootinput_wait_event();
+        RootInputEvent event =
+            rootinput_wait_event();
 
-        /* ========================================================
-         * TERMINAL MOUSE SELECTION
-         * ======================================================== */
+
+        /*
+         * ========================================================
+         * MOUSE
+         * ========================================================
+         */
 
         if (
-            event.type == ROOT_INPUT_MOUSE_BUTTON_DOWN &&
-            event.button == ROOT_MOUSE_LEFT
+            event.type
+            ==
+            ROOT_INPUT_MOUSE_CLICK
         )
         {
-            terminal_selection_begin(
-                event.mouse_x,
-                event.mouse_y
+            shell_mouse_click(
+                &event
             );
 
             continue;
         }
 
-        if (event.type == ROOT_INPUT_MOUSE_DRAG)
-        {
-            terminal_selection_drag(
-                event.mouse_x,
-                event.mouse_y
-            );
 
-            continue;
-        }
+        /*
+         * Shell procesa solamente KEY DOWN.
+         */
 
         if (
-            event.type == ROOT_INPUT_MOUSE_BUTTON_UP &&
-            event.button == ROOT_MOUSE_LEFT
+            event.type
+            !=
+            ROOT_INPUT_KEY_DOWN
         )
         {
-            terminal_selection_end();
             continue;
         }
+
+
+        /*
+         * ========================================================
+         * CTRL
+         * ========================================================
+         */
 
         if (
-            event.type == ROOT_INPUT_MOUSE_DOUBLE_CLICK &&
-            event.button == ROOT_MOUSE_LEFT
+            event.ctrl
         )
         {
-            terminal_selection_select_word(
-                event.mouse_x,
-                event.mouse_y
-            );
+            if (
+                event.key
+                ==
+                ROOT_KEY_A
+            )
+            {
+                command_cursor =
+                    0;
 
-            continue;
+
+                shell_update_cursor();
+
+                continue;
+            }
+
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_E
+            )
+            {
+                command_cursor =
+                    command_length;
+
+
+                shell_update_cursor();
+
+                continue;
+            }
+
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_U
+            )
+            {
+                shell_clear_input();
+
+
+                command_history_position =
+                    -1;
+
+
+                continue;
+            }
+
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_L
+            )
+            {
+                terminal_clear();
+
+
+                shell_prompt();
+
+
+                shell_redraw_line();
+
+                continue;
+            }
+
+
+            if (
+                event.key
+                ==
+                ROOT_KEY_C
+            )
+            {
+                terminal_print(
+                    "^C\n"
+                );
+
+
+                command_length =
+                    0;
+
+
+                command_cursor =
+                    0;
+
+
+                rendered_length =
+                    0;
+
+
+                command_buffer[0] =
+                    0;
+
+
+                command_history_position =
+                    -1;
+
+
+                shell_prompt();
+
+                continue;
+            }
         }
 
-        if (event.type == ROOT_INPUT_MOUSE_CLICK)
-        {
-            /* A plain click in the active command line moves its caret. */
-            if (!terminal_selection_active())
-                shell_mouse_click(&event);
 
-            continue;
-        }
-
-        if (event.type != ROOT_INPUT_KEY_DOWN)
-            continue;
-
-        /* ========================================================
-         * STANDARD TERMINAL SCROLLBACK
-         * ======================================================== */
+        /*
+         * ========================================================
+         * COMMAND HISTORY
+         * ========================================================
+         */
 
         if (
-            event.shift &&
-            !event.ctrl &&
-            !event.alt &&
-            event.key == ROOT_KEY_PAGE_UP
+            event.key
+            ==
+            ROOT_KEY_UP
         )
-        {
-            u32 amount = terminal_get_rows() / 2u;
-            if (amount == 0)
-                amount = 1;
-
-            terminal_scrollback_up(amount);
-            continue;
-        }
-
-        if (
-            event.shift &&
-            !event.ctrl &&
-            !event.alt &&
-            event.key == ROOT_KEY_PAGE_DOWN
-        )
-        {
-            u32 amount = terminal_get_rows() / 2u;
-            if (amount == 0)
-                amount = 1;
-
-            terminal_scrollback_down(amount);
-            continue;
-        }
-
-        RootTextAction action = roottext_terminal_action(&event);
-
-        /* Ctrl+Shift+C copies without returning from scrollback view. */
-        if (action == ROOT_TEXT_ACTION_TERMINAL_COPY)
-        {
-            terminal_selection_copy();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_TERMINAL_PASTE)
-        {
-            terminal_scrollback_bottom();
-            terminal_selection_clear();
-            shell_paste_clipboard();
-            continue;
-        }
-
-        /* Keyboard editing always returns to the live prompt. */
-        terminal_scrollback_bottom();
-
-        if (action == ROOT_TEXT_ACTION_LINE_START)
-        {
-            command_cursor = 0;
-            shell_update_cursor();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_LINE_END)
-        {
-            command_cursor = command_length;
-            shell_update_cursor();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_LINE_CLEAR)
-        {
-            shell_clear_input();
-            command_history_position = -1;
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_CLEAR_SCREEN)
-        {
-            terminal_clear();
-            shell_prompt();
-            shell_redraw_line();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_INTERRUPT)
-        {
-            terminal_print("^C\n");
-
-            command_length = 0;
-            command_cursor = 0;
-            rendered_length = 0;
-            command_buffer[0] = 0;
-            command_history_position = -1;
-
-            shell_prompt();
-            continue;
-        }
-
-        if (action == ROOT_TEXT_ACTION_SUSPEND)
-        {
-            /* Reserved for job control once processes exist. */
-            continue;
-        }
-
-        /* Any other Ctrl/Alt combination is not text. */
-        if (event.ctrl || (event.alt && !event.altgr))
-            continue;
-
-        /* ========================================================
-         * HISTORY
-         * ======================================================== */
-
-        if (event.key == ROOT_KEY_UP)
         {
             shell_history_previous();
+
             continue;
         }
 
-        if (event.key == ROOT_KEY_DOWN)
-        {
-            shell_history_next();
-            continue;
-        }
-
-        /* ========================================================
-         * ENTER
-         * ======================================================== */
 
         if (
-            event.key == ROOT_KEY_ENTER ||
-            event.key == ROOT_KEY_KP_ENTER
+            event.key
+            ==
+            ROOT_KEY_DOWN
         )
         {
-            command_cursor = command_length;
+            shell_history_next();
+
+            continue;
+        }
+
+
+        /*
+         * ========================================================
+         * ENTER
+         * ========================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_ENTER
+            ||
+            event.key
+            ==
+            ROOT_KEY_KP_ENTER
+        )
+        {
+            command_cursor =
+                command_length;
+
+
             shell_update_cursor();
-            terminal_putchar('\n');
+
+
+            terminal_putchar(
+                '\n'
+            );
+
+
+            /*
+             * Guardar antes de vaciar.
+             */
 
             shell_history_add_current();
 
-            if (shell_build_utf8())
+
+            if (
+                shell_build_utf8()
+            )
             {
-                bool batched =
-                    shell_command_can_batch(command_utf8);
-
-                if (batched)
-                    terminal_begin_output_batch();
-
-                execute_command(command_utf8);
-
-                if (batched)
-                    terminal_end_batch();
+                execute_command(
+                    command_utf8
+                );
             }
 
-            command_length = 0;
-            command_cursor = 0;
-            rendered_length = 0;
-            command_buffer[0] = 0;
-            command_history_position = -1;
+
+            command_length =
+                0;
+
+
+            command_cursor =
+                0;
+
+
+            rendered_length =
+                0;
+
+
+            command_buffer[0] =
+                0;
+
+
+            command_history_position =
+                -1;
+
 
             shell_prompt();
+
             continue;
         }
 
-        /* ========================================================
-         * CURSOR MOVEMENT
-         * ======================================================== */
 
-        if (event.key == ROOT_KEY_LEFT)
+        /*
+         * ========================================================
+         * LEFT / RIGHT
+         * ========================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_LEFT
+        )
         {
-            if (command_cursor > 0)
+            if (
+                command_cursor > 0
+            )
             {
                 command_cursor--;
+
+
                 shell_update_cursor();
             }
+
 
             continue;
         }
 
-        if (event.key == ROOT_KEY_RIGHT)
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_RIGHT
+        )
         {
-            if (command_cursor < command_length)
+            if (
+                command_cursor
+                <
+                command_length
+            )
             {
                 command_cursor++;
+
+
                 shell_update_cursor();
             }
 
+
             continue;
         }
 
-        if (event.key == ROOT_KEY_HOME)
+
+        /*
+         * ========================================================
+         * HOME / END
+         * ========================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_HOME
+        )
         {
-            command_cursor = 0;
+            command_cursor =
+                0;
+
+
             shell_update_cursor();
+
             continue;
         }
 
-        if (event.key == ROOT_KEY_END)
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_END
+        )
         {
-            command_cursor = command_length;
+            command_cursor =
+                command_length;
+
+
             shell_update_cursor();
+
             continue;
         }
 
-        /* ========================================================
-         * DELETE
-         * ======================================================== */
 
-        if (event.key == ROOT_KEY_BACKSPACE)
+        /*
+         * ========================================================
+         * BACKSPACE
+         * ========================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_BACKSPACE
+        )
         {
-            command_history_position = -1;
+            command_history_position =
+                -1;
+
+
             shell_backspace();
+
             continue;
         }
 
-        if (event.key == ROOT_KEY_DELETE)
+
+        /*
+         * ========================================================
+         * DELETE
+         * ========================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_DELETE
+        )
         {
-            command_history_position = -1;
+            command_history_position =
+                -1;
+
+
             shell_delete();
+
             continue;
         }
 
-        /* ========================================================
-         * TEXT
-         * ======================================================== */
 
-        if (roottext_should_insert(&event))
+        /*
+         * ========================================================
+         * UNICODE TEXT
+         * ========================================================
+         */
+
+        if (
+            event.codepoint
+            !=
+            0
+        )
         {
-            command_history_position = -1;
-            shell_insert_codepoint(event.codepoint);
+            command_history_position =
+                -1;
+
+
+            shell_insert_codepoint(
+                event.codepoint
+            );
+
             continue;
         }
     }
