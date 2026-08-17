@@ -2,6 +2,7 @@
 
 #include "terminal.h"
 #include "rootinput.h"
+#include "rootedit.h"
 
 #include "unicode.h"
 
@@ -46,6 +47,33 @@ static u32 input_start_row = 0;
 
 static u32 input_start_col = 0;
 
+/*
+ * ============================================================
+ * COMMAND HISTORY
+ * ============================================================
+ */
+
+#define SHELL_HISTORY_SIZE 32
+
+
+static RootCodepoint command_history[
+    SHELL_HISTORY_SIZE
+][
+    COMMAND_BUFFER_SIZE
+];
+
+
+static u32 command_history_length[
+    SHELL_HISTORY_SIZE
+];
+
+
+static u32 command_history_count =
+    0;
+
+
+static i32 command_history_position =
+    -1;
 
 /*
  * =====================================
@@ -56,75 +84,112 @@ static u32 input_start_col = 0;
 static void command_help(void)
 {
     terminal_print(
-        "Comandos disponibles:\n\n"
+        "RootOS commands:\n\n"
     );
 
-    terminal_print(
-        "help                  Mostrar comandos\n"
-    );
 
     terminal_print(
-        "clear                 Limpiar pantalla\n"
+        "help                         Show commands\n"
     );
 
-    terminal_print(
-        "echo <texto>          Mostrar texto\n"
-    );
 
     terminal_print(
-        "about                 Informacion del OS\n"
+        "clear                        Clear terminal\n"
     );
 
-    terminal_print(
-        "godir <ruta>          Cambiar carpeta\n"
-    );
 
     terminal_print(
-        "seedir                Mostrar ruta actual\n"
+        "about                        Show RootOS information\n"
     );
 
-    terminal_print(
-        "see                   Ver carpeta actual\n"
-    );
 
     terminal_print(
-        "see <ruta>            Ver otra carpeta\n"
+        "echo <text>                  Print text\n"
     );
 
-    terminal_print(
-        "seedir(\"nombre\")      Buscar carpetas\n"
-    );
 
     terminal_print(
-        "reboot                Reiniciar\n"
+        "godir <path>                 Change directory\n"
     );
 
-    terminal_print(
-        "shutdown              Apagar QEMU\n"
-    );
 
     terminal_print(
-        "create --file <ruta>    Crear archivo\n"
+        "seedir                       Show current directory\n"
     );
 
-    terminal_print(
-        "create --folder <ruta>  Crear carpeta\n"
-    );
 
     terminal_print(
-        "remove <ruta>           Eliminar archivo/carpeta\n"
+        "seedir(\"name\")               Find directories\n"
     );
 
-    terminal_print(
-        "remove -r <ruta>        Eliminar recursivamente\n"
-    );
 
     terminal_print(
-        "copy <origen> <destino> Copiar\n"
+        "see                           List current directory\n"
     );
 
+
     terminal_print(
-        "move <origen> <destino> Mover\n"
+        "see <path>                    List directory\n"
+    );
+
+
+    terminal_print(
+        "create --file <path>          Create file\n"
+    );
+
+
+    terminal_print(
+        "create --folder <path>        Create folder\n"
+    );
+
+
+    terminal_print(
+        "remove <path>                 Remove file/folder\n"
+    );
+
+
+    terminal_print(
+        "remove -r <path>              Remove recursively\n"
+    );
+
+
+    terminal_print(
+        "copy <source> <destination>   Copy\n"
+    );
+
+
+    terminal_print(
+        "move <source> <destination>   Move\n"
+    );
+
+
+    terminal_print(
+        "readfile <path>               Read text file\n"
+    );
+
+
+    terminal_print(
+        "writefile <path> \"text\"      Replace file content\n"
+    );
+
+
+    terminal_print(
+        "appendfile <path> \"text\"     Append file content\n"
+    );
+
+
+    terminal_print(
+        "editfile <path>               Open RootEdit\n"
+    );
+
+
+    terminal_print(
+        "reboot                        Reboot\n"
+    );
+
+
+    terminal_print(
+        "shutdown                      Shutdown QEMU\n"
     );
 }
 
@@ -518,7 +583,9 @@ static void shell_print_fs_result(
     FsResult result
 )
 {
-    switch (result)
+    switch (
+        result
+    )
     {
         case FS_RESULT_OK:
 
@@ -577,7 +644,7 @@ static void shell_print_fs_result(
         case FS_RESULT_NO_SPACE:
 
             terminal_print(
-                "Filesystem node table is full.\n"
+                "No space available.\n"
             );
 
             break;
@@ -587,6 +654,24 @@ static void shell_print_fs_result(
 
             terminal_print(
                 "Resource is busy or protected.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_NOT_FILE:
+
+            terminal_print(
+                "Path is not a file.\n"
+            );
+
+            break;
+
+
+        case FS_RESULT_FILE_TOO_LARGE:
+
+            terminal_print(
+                "File is too large.\n"
             );
 
             break;
@@ -867,10 +952,262 @@ static void command_move(
 }
 
 /*
- * =====================================
- * INTERPRETAR COMANDO
- * =====================================
+ * ============================================================
+ * READFILE
+ * ============================================================
  */
+
+static void command_readfile(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char path[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            path,
+            sizeof(path)
+        )
+    )
+    {
+        terminal_print(
+            "Usage: readfile <path>\n"
+        );
+
+        return;
+    }
+
+
+    static char file_buffer[
+        FS_MAX_FILE_SIZE + 1
+    ];
+
+
+    usize size =
+        0;
+
+
+    FsResult result =
+        filesystem_read_file(
+            path,
+            file_buffer,
+            sizeof(file_buffer),
+            &size
+        );
+
+
+    if (
+        result
+        !=
+        FS_RESULT_OK
+    )
+    {
+        shell_print_fs_result(
+            result
+        );
+
+        return;
+    }
+
+
+    terminal_print(
+        file_buffer
+    );
+
+
+    if (
+        size == 0
+        ||
+        file_buffer[
+            size - 1
+        ]
+        !=
+        '\n'
+    )
+    {
+        terminal_putchar(
+            '\n'
+        );
+    }
+}
+
+
+/*
+ * ============================================================
+ * WRITEFILE
+ * ============================================================
+ */
+
+static void command_writefile(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char path[
+        ROOT_PATH_MAX
+    ];
+
+
+    char text[
+        FS_MAX_FILE_SIZE + 1
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            path,
+            sizeof(path)
+        )
+        ||
+        !shell_read_argument(
+            &cursor,
+            text,
+            sizeof(text)
+        )
+    )
+    {
+        terminal_print(
+            "Usage: writefile <path> \"text\"\n"
+        );
+
+        return;
+    }
+
+
+    shell_print_fs_result(
+        filesystem_write_file(
+            path,
+            text,
+            root_strlen(
+                text
+            )
+        )
+    );
+}
+
+
+/*
+ * ============================================================
+ * APPENDFILE
+ * ============================================================
+ */
+
+static void command_appendfile(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char path[
+        ROOT_PATH_MAX
+    ];
+
+
+    char text[
+        FS_MAX_FILE_SIZE + 1
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            path,
+            sizeof(path)
+        )
+        ||
+        !shell_read_argument(
+            &cursor,
+            text,
+            sizeof(text)
+        )
+    )
+    {
+        terminal_print(
+            "Usage: appendfile <path> \"text\"\n"
+        );
+
+        return;
+    }
+
+
+    shell_print_fs_result(
+        filesystem_append_file(
+            path,
+            text,
+            root_strlen(
+                text
+            )
+        )
+    );
+}
+
+
+/*
+ * ============================================================
+ * EDITFILE
+ * ============================================================
+ */
+
+static void command_editfile(
+    const char* arguments
+)
+{
+    const char* cursor =
+        arguments;
+
+
+    char path[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !shell_read_argument(
+            &cursor,
+            path,
+            sizeof(path)
+        )
+    )
+    {
+        terminal_print(
+            "Usage: editfile <path>\n"
+        );
+
+        return;
+    }
+
+
+    FsResult result =
+        rootedit_open(
+            path
+        );
+
+
+    if (
+        result
+        !=
+        FS_RESULT_OK
+    )
+    {
+        shell_print_fs_result(
+            result
+        );
+    }
+}
 
 /*
  * =====================================
@@ -882,12 +1219,6 @@ static void execute_command(
     const char* command
 )
 {
-    /*
-     * ============================================================
-     * EMPTY COMMAND
-     * ============================================================
-     */
-
     if (
         command == NULL
         ||
@@ -897,12 +1228,6 @@ static void execute_command(
         return;
     }
 
-
-    /*
-     * ============================================================
-     * HELP
-     * ============================================================
-     */
 
     if (
         root_streq(
@@ -917,12 +1242,6 @@ static void execute_command(
     }
 
 
-    /*
-     * ============================================================
-     * CLEAR
-     * ============================================================
-     */
-
     if (
         root_streq(
             command,
@@ -935,12 +1254,6 @@ static void execute_command(
         return;
     }
 
-
-    /*
-     * ============================================================
-     * ABOUT
-     * ============================================================
-     */
 
     if (
         root_streq(
@@ -1029,7 +1342,7 @@ static void execute_command(
 
     /*
      * ============================================================
-     * SEEDIR("NAME")
+     * SEEDIR SEARCH
      * ============================================================
      */
 
@@ -1047,12 +1360,6 @@ static void execute_command(
         return;
     }
 
-
-    /*
-     * ============================================================
-     * SEEDIR
-     * ============================================================
-     */
 
     if (
         root_streq(
@@ -1254,6 +1561,150 @@ static void execute_command(
 
     /*
      * ============================================================
+     * READFILE
+     * ============================================================
+     */
+
+    if (
+        root_streq(
+            command,
+            "readfile"
+        )
+    )
+    {
+        terminal_print(
+            "Usage: readfile <path>\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "readfile "
+        )
+    )
+    {
+        command_readfile(
+            command + 9
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
+     * WRITEFILE
+     * ============================================================
+     */
+
+    if (
+        root_streq(
+            command,
+            "writefile"
+        )
+    )
+    {
+        terminal_print(
+            "Usage: writefile <path> \"text\"\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "writefile "
+        )
+    )
+    {
+        command_writefile(
+            command + 10
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
+     * APPENDFILE
+     * ============================================================
+     */
+
+    if (
+        root_streq(
+            command,
+            "appendfile"
+        )
+    )
+    {
+        terminal_print(
+            "Usage: appendfile <path> \"text\"\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "appendfile "
+        )
+    )
+    {
+        command_appendfile(
+            command + 11
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
+     * EDITFILE
+     * ============================================================
+     */
+
+    if (
+        root_streq(
+            command,
+            "editfile"
+        )
+    )
+    {
+        terminal_print(
+            "Usage: editfile <path>\n"
+        );
+
+        return;
+    }
+
+
+    if (
+        root_starts_with(
+            command,
+            "editfile "
+        )
+    )
+    {
+        command_editfile(
+            command + 9
+        );
+
+        return;
+    }
+
+
+    /*
+     * ============================================================
      * REBOOT
      * ============================================================
      */
@@ -1292,7 +1743,7 @@ static void execute_command(
 
     /*
      * ============================================================
-     * UNKNOWN COMMAND
+     * UNKNOWN
      * ============================================================
      */
 
@@ -1300,9 +1751,11 @@ static void execute_command(
         "Unknown command: "
     );
 
+
     terminal_print(
         command
     );
+
 
     terminal_putchar(
         '\n'
@@ -1471,6 +1924,316 @@ static void shell_redraw_line(void)
     shell_update_cursor();
 }
 
+/*
+ * ============================================================
+ * HISTORY - LOAD BUFFER
+ * ============================================================
+ */
+
+static void shell_history_load(
+    u32 history_index
+)
+{
+    if (
+        history_index
+        >=
+        command_history_count
+    )
+    {
+        return;
+    }
+
+
+    command_length =
+        command_history_length[
+            history_index
+        ];
+
+
+    for (
+        u32 i = 0;
+        i < command_length;
+        i++
+    )
+    {
+        command_buffer[i] =
+            command_history[
+                history_index
+            ][
+                i
+            ];
+    }
+
+
+    command_buffer[
+        command_length
+    ] =
+        0;
+
+
+    command_cursor =
+        command_length;
+
+
+    shell_redraw_line();
+}
+
+
+/*
+ * ============================================================
+ * HISTORY - ADD CURRENT COMMAND
+ * ============================================================
+ */
+
+static void shell_history_add_current(void)
+{
+    if (
+        command_length == 0
+    )
+    {
+        command_history_position =
+            -1;
+
+
+        return;
+    }
+
+
+    /*
+     * Evitar guardar dos comandos
+     * consecutivos idénticos.
+     */
+
+    if (
+        command_history_count > 0
+    )
+    {
+        u32 last =
+            command_history_count - 1;
+
+
+        if (
+            command_history_length[last]
+            ==
+            command_length
+        )
+        {
+            bool equal =
+                true;
+
+
+            for (
+                u32 i = 0;
+                i < command_length;
+                i++
+            )
+            {
+                if (
+                    command_history[last][i]
+                    !=
+                    command_buffer[i]
+                )
+                {
+                    equal =
+                        false;
+
+
+                    break;
+                }
+            }
+
+
+            if (
+                equal
+            )
+            {
+                command_history_position =
+                    -1;
+
+
+                return;
+            }
+        }
+    }
+
+
+    /*
+     * Cola llena:
+     * eliminar comando más antiguo.
+     */
+
+    if (
+        command_history_count
+        >=
+        SHELL_HISTORY_SIZE
+    )
+    {
+        for (
+            u32 i = 1;
+            i < SHELL_HISTORY_SIZE;
+            i++
+        )
+        {
+            command_history_length[
+                i - 1
+            ] =
+                command_history_length[
+                    i
+                ];
+
+
+            for (
+                u32 j = 0;
+                j <
+                command_history_length[i];
+
+                j++
+            )
+            {
+                command_history[
+                    i - 1
+                ][
+                    j
+                ] =
+                    command_history[
+                        i
+                    ][
+                        j
+                    ];
+            }
+        }
+
+
+        command_history_count =
+            SHELL_HISTORY_SIZE - 1;
+    }
+
+
+    u32 index =
+        command_history_count;
+
+
+    command_history_length[
+        index
+    ] =
+        command_length;
+
+
+    for (
+        u32 i = 0;
+        i < command_length;
+        i++
+    )
+    {
+        command_history[
+            index
+        ][
+            i
+        ] =
+            command_buffer[i];
+    }
+
+
+    command_history_count++;
+
+
+    command_history_position =
+        -1;
+}
+
+
+/*
+ * ============================================================
+ * HISTORY - PREVIOUS
+ * ============================================================
+ */
+
+static void shell_history_previous(void)
+{
+    if (
+        command_history_count == 0
+    )
+    {
+        return;
+    }
+
+
+    if (
+        command_history_position < 0
+    )
+    {
+        command_history_position =
+            (i32)command_history_count
+            -
+            1;
+    }
+
+    else if (
+        command_history_position > 0
+    )
+    {
+        command_history_position--;
+    }
+
+
+    shell_history_load(
+        (u32)command_history_position
+    );
+}
+
+
+/*
+ * ============================================================
+ * HISTORY - NEXT
+ * ============================================================
+ */
+
+static void shell_history_next(void)
+{
+    if (
+        command_history_position < 0
+    )
+    {
+        return;
+    }
+
+
+    if (
+        command_history_position
+        <
+        (i32)command_history_count - 1
+    )
+    {
+        command_history_position++;
+
+
+        shell_history_load(
+            (u32)command_history_position
+        );
+
+
+        return;
+    }
+
+
+    command_history_position =
+        -1;
+
+
+    command_length =
+        0;
+
+
+    command_cursor =
+        0;
+
+
+    command_buffer[0] =
+        0;
+
+
+    shell_redraw_line();
+}
 
 /*
  * ============================================================
@@ -1872,6 +2635,11 @@ void shell_run(void)
     command_buffer[0] = 0;
 
 
+    command_history_count = 0;
+
+    command_history_position = -1;
+
+
     shell_prompt();
 
 
@@ -1882,9 +2650,9 @@ void shell_run(void)
 
 
         /*
-         * ========================================
+         * ========================================================
          * MOUSE
-         * ========================================
+         * ========================================================
          */
 
         if (
@@ -1902,9 +2670,9 @@ void shell_run(void)
 
 
         /*
-         * Solo KEY DOWN afecta
-         * actualmente a la shell.
+         * Shell procesa solamente KEY DOWN.
          */
+
         if (
             event.type
             !=
@@ -1916,23 +2684,24 @@ void shell_run(void)
 
 
         /*
-         * ========================================
-         * CTRL SHORTCUTS
-         * ========================================
+         * ========================================================
+         * CTRL
+         * ========================================================
          */
 
-        if (event.ctrl)
+        if (
+            event.ctrl
+        )
         {
-            /*
-             * Ctrl+A
-             */
             if (
                 event.key
                 ==
                 ROOT_KEY_A
             )
             {
-                command_cursor = 0;
+                command_cursor =
+                    0;
+
 
                 shell_update_cursor();
 
@@ -1940,9 +2709,6 @@ void shell_run(void)
             }
 
 
-            /*
-             * Ctrl+E
-             */
             if (
                 event.key
                 ==
@@ -1952,15 +2718,13 @@ void shell_run(void)
                 command_cursor =
                     command_length;
 
+
                 shell_update_cursor();
 
                 continue;
             }
 
 
-            /*
-             * Ctrl+U
-             */
             if (
                 event.key
                 ==
@@ -1969,13 +2733,15 @@ void shell_run(void)
             {
                 shell_clear_input();
 
+
+                command_history_position =
+                    -1;
+
+
                 continue;
             }
 
 
-            /*
-             * Ctrl+L
-             */
             if (
                 event.key
                 ==
@@ -1984,7 +2750,9 @@ void shell_run(void)
             {
                 terminal_clear();
 
+
                 shell_prompt();
+
 
                 shell_redraw_line();
 
@@ -1992,9 +2760,6 @@ void shell_run(void)
             }
 
 
-            /*
-             * Ctrl+C
-             */
             if (
                 event.key
                 ==
@@ -2006,13 +2771,24 @@ void shell_run(void)
                 );
 
 
-                command_length = 0;
+                command_length =
+                    0;
 
-                command_cursor = 0;
 
-                rendered_length = 0;
+                command_cursor =
+                    0;
 
-                command_buffer[0] = 0;
+
+                rendered_length =
+                    0;
+
+
+                command_buffer[0] =
+                    0;
+
+
+                command_history_position =
+                    -1;
 
 
                 shell_prompt();
@@ -2023,9 +2799,39 @@ void shell_run(void)
 
 
         /*
-         * ========================================
+         * ========================================================
+         * COMMAND HISTORY
+         * ========================================================
+         */
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_UP
+        )
+        {
+            shell_history_previous();
+
+            continue;
+        }
+
+
+        if (
+            event.key
+            ==
+            ROOT_KEY_DOWN
+        )
+        {
+            shell_history_next();
+
+            continue;
+        }
+
+
+        /*
+         * ========================================================
          * ENTER
-         * ========================================
+         * ========================================================
          */
 
         if (
@@ -2050,6 +2856,13 @@ void shell_run(void)
             );
 
 
+            /*
+             * Guardar antes de vaciar.
+             */
+
+            shell_history_add_current();
+
+
             if (
                 shell_build_utf8()
             )
@@ -2060,13 +2873,24 @@ void shell_run(void)
             }
 
 
-            command_length = 0;
+            command_length =
+                0;
 
-            command_cursor = 0;
 
-            rendered_length = 0;
+            command_cursor =
+                0;
 
-            command_buffer[0] = 0;
+
+            rendered_length =
+                0;
+
+
+            command_buffer[0] =
+                0;
+
+
+            command_history_position =
+                -1;
 
 
             shell_prompt();
@@ -2076,9 +2900,9 @@ void shell_run(void)
 
 
         /*
-         * ========================================
-         * MOVIMIENTO
-         * ========================================
+         * ========================================================
+         * LEFT / RIGHT
+         * ========================================================
          */
 
         if (
@@ -2092,6 +2916,7 @@ void shell_run(void)
             )
             {
                 command_cursor--;
+
 
                 shell_update_cursor();
             }
@@ -2115,6 +2940,7 @@ void shell_run(void)
             {
                 command_cursor++;
 
+
                 shell_update_cursor();
             }
 
@@ -2123,13 +2949,21 @@ void shell_run(void)
         }
 
 
+        /*
+         * ========================================================
+         * HOME / END
+         * ========================================================
+         */
+
         if (
             event.key
             ==
             ROOT_KEY_HOME
         )
         {
-            command_cursor = 0;
+            command_cursor =
+                0;
+
 
             shell_update_cursor();
 
@@ -2146,6 +2980,7 @@ void shell_run(void)
             command_cursor =
                 command_length;
 
+
             shell_update_cursor();
 
             continue;
@@ -2153,9 +2988,9 @@ void shell_run(void)
 
 
         /*
-         * ========================================
-         * BORRAR
-         * ========================================
+         * ========================================================
+         * BACKSPACE
+         * ========================================================
          */
 
         if (
@@ -2164,11 +2999,21 @@ void shell_run(void)
             ROOT_KEY_BACKSPACE
         )
         {
+            command_history_position =
+                -1;
+
+
             shell_backspace();
 
             continue;
         }
 
+
+        /*
+         * ========================================================
+         * DELETE
+         * ========================================================
+         */
 
         if (
             event.key
@@ -2176,6 +3021,10 @@ void shell_run(void)
             ROOT_KEY_DELETE
         )
         {
+            command_history_position =
+                -1;
+
+
             shell_delete();
 
             continue;
@@ -2183,9 +3032,9 @@ void shell_run(void)
 
 
         /*
-         * ========================================
-         * TEXTO UNICODE
-         * ========================================
+         * ========================================================
+         * UNICODE TEXT
+         * ========================================================
          */
 
         if (
@@ -2194,6 +3043,10 @@ void shell_run(void)
             0
         )
         {
+            command_history_position =
+                -1;
+
+
             shell_insert_codepoint(
                 event.codepoint
             );

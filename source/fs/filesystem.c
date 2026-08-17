@@ -43,6 +43,24 @@ typedef struct
         ROOT_PATH_MAX
     ];
 
+
+    /*
+     * ========================================================
+     * FILE CONTENT
+     * ========================================================
+     *
+     * Por ahora cada archivo dispone de hasta 4096 bytes.
+     *
+     * En v0.38/v0.39 eliminaremos este límite fijo usando
+     * memoria dinámica y bloques.
+     */
+
+    usize size;
+
+    char content[
+        FS_MAX_FILE_SIZE + 1
+    ];
+
 } FsNode;
 
 
@@ -241,7 +259,9 @@ static FsResult add_node_absolute(
 )
 {
     if (
-        find_node(path)
+        find_node(
+            path
+        )
         >=
         0
     )
@@ -281,6 +301,14 @@ static FsResult add_node_absolute(
 
     nodes[index].type =
         type;
+
+
+    nodes[index].size =
+        0;
+
+
+    nodes[index].content[0] =
+        '\0';
 
 
     nodes[index].used =
@@ -1552,10 +1580,11 @@ FsResult filesystem_copy(
      * No copiar un directorio dentro
      * de sí mismo.
      */
+
     if (
         nodes[source_index].type
-            ==
-            FS_DIRECTORY
+        ==
+        FS_DIRECTORY
         &&
         path_is_inside(
             source_path,
@@ -1569,8 +1598,9 @@ FsResult filesystem_copy(
 
 
     /*
-     * Crear padres del destino.
+     * Crear carpeta padre del destino.
      */
+
     char parent[
         ROOT_PATH_MAX
     ];
@@ -1606,9 +1636,11 @@ FsResult filesystem_copy(
 
 
     /*
-     * Contar cuántos nodos vamos a copiar.
+     * Contar nodos necesarios.
      */
-    usize required = 0;
+
+    usize required =
+        0;
 
 
     for (
@@ -1649,8 +1681,9 @@ FsResult filesystem_copy(
 
 
     /*
-     * Validar primero longitudes.
+     * Validar rutas antes de empezar.
      */
+
     for (
         usize i = 0;
         i < FS_MAX_NODES;
@@ -1695,15 +1728,12 @@ FsResult filesystem_copy(
 
 
     /*
-     * Copiar.
+     * Copiar nodos.
      */
-    usize original_count =
-        FS_MAX_NODES;
-
 
     for (
         usize i = 0;
-        i < original_count;
+        i < FS_MAX_NODES;
         i++
     )
     {
@@ -1719,11 +1749,6 @@ FsResult filesystem_copy(
             continue;
         }
 
-
-        /*
-         * Las copias están fuera de source,
-         * por lo tanto no serán procesadas de nuevo.
-         */
 
         const char* suffix =
             nodes[i].path
@@ -1770,6 +1795,55 @@ FsResult filesystem_copy(
         )
         {
             return result;
+        }
+
+
+        /*
+         * Si es archivo, copiar también
+         * tamaño y contenido.
+         */
+
+        if (
+            nodes[i].type
+            ==
+            FS_FILE
+        )
+        {
+            int target_index =
+                find_node(
+                    target
+                );
+
+
+            if (
+                target_index < 0
+            )
+            {
+                return
+                    FS_RESULT_NOT_FOUND;
+            }
+
+
+            nodes[target_index].size =
+                nodes[i].size;
+
+
+            if (
+                nodes[i].size > 0
+            )
+            {
+                root_memcpy(
+                    nodes[target_index].content,
+                    nodes[i].content,
+                    nodes[i].size
+                );
+            }
+
+
+            nodes[target_index].content[
+                nodes[target_index].size
+            ] =
+                '\0';
         }
     }
 
@@ -2080,6 +2154,344 @@ FsResult filesystem_move(
             ROOT_PATH_MAX
         );
     }
+
+
+    return
+        FS_RESULT_OK;
+}
+
+/*
+ * ============================================================
+ * READ FILE
+ * ============================================================
+ */
+
+FsResult filesystem_read_file(
+    const char* path,
+    char* output,
+    usize output_size,
+    usize* result_size
+)
+{
+    if (
+        path == NULL
+        ||
+        output == NULL
+        ||
+        output_size == 0
+    )
+    {
+        return
+            FS_RESULT_INVALID_PATH;
+    }
+
+
+    char resolved[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !root_path_resolve(
+            current_directory,
+            path,
+            resolved,
+            ROOT_PATH_MAX
+        )
+    )
+    {
+        return
+            FS_RESULT_INVALID_PATH;
+    }
+
+
+    int index =
+        find_node(
+            resolved
+        );
+
+
+    if (
+        index < 0
+    )
+    {
+        return
+            FS_RESULT_NOT_FOUND;
+    }
+
+
+    if (
+        nodes[index].type
+        !=
+        FS_FILE
+    )
+    {
+        return
+            FS_RESULT_NOT_FILE;
+    }
+
+
+    if (
+        nodes[index].size + 1
+        >
+        output_size
+    )
+    {
+        return
+            FS_RESULT_NO_SPACE;
+    }
+
+
+    if (
+        nodes[index].size > 0
+    )
+    {
+        root_memcpy(
+            output,
+            nodes[index].content,
+            nodes[index].size
+        );
+    }
+
+
+    output[
+        nodes[index].size
+    ] =
+        '\0';
+
+
+    if (
+        result_size != NULL
+    )
+    {
+        *result_size =
+            nodes[index].size;
+    }
+
+
+    return
+        FS_RESULT_OK;
+}
+
+
+/*
+ * ============================================================
+ * WRITE FILE
+ * ============================================================
+ */
+
+FsResult filesystem_write_file(
+    const char* path,
+    const char* data,
+    usize size
+)
+{
+    if (
+        path == NULL
+        ||
+        (
+            data == NULL
+            &&
+            size != 0
+        )
+    )
+    {
+        return
+            FS_RESULT_INVALID_PATH;
+    }
+
+
+    if (
+        size
+        >
+        FS_MAX_FILE_SIZE
+    )
+    {
+        return
+            FS_RESULT_FILE_TOO_LARGE;
+    }
+
+
+    char resolved[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !root_path_resolve(
+            current_directory,
+            path,
+            resolved,
+            ROOT_PATH_MAX
+        )
+    )
+    {
+        return
+            FS_RESULT_INVALID_PATH;
+    }
+
+
+    int index =
+        find_node(
+            resolved
+        );
+
+
+    if (
+        index < 0
+    )
+    {
+        return
+            FS_RESULT_NOT_FOUND;
+    }
+
+
+    if (
+        nodes[index].type
+        !=
+        FS_FILE
+    )
+    {
+        return
+            FS_RESULT_NOT_FILE;
+    }
+
+
+    if (
+        size > 0
+    )
+    {
+        root_memcpy(
+            nodes[index].content,
+            data,
+            size
+        );
+    }
+
+
+    nodes[index].size =
+        size;
+
+
+    nodes[index].content[
+        size
+    ] =
+        '\0';
+
+
+    return
+        FS_RESULT_OK;
+}
+
+
+/*
+ * ============================================================
+ * APPEND FILE
+ * ============================================================
+ */
+
+FsResult filesystem_append_file(
+    const char* path,
+    const char* data,
+    usize size
+)
+{
+    if (
+        path == NULL
+        ||
+        (
+            data == NULL
+            &&
+            size != 0
+        )
+    )
+    {
+        return
+            FS_RESULT_INVALID_PATH;
+    }
+
+
+    char resolved[
+        ROOT_PATH_MAX
+    ];
+
+
+    if (
+        !root_path_resolve(
+            current_directory,
+            path,
+            resolved,
+            ROOT_PATH_MAX
+        )
+    )
+    {
+        return
+            FS_RESULT_INVALID_PATH;
+    }
+
+
+    int index =
+        find_node(
+            resolved
+        );
+
+
+    if (
+        index < 0
+    )
+    {
+        return
+            FS_RESULT_NOT_FOUND;
+    }
+
+
+    if (
+        nodes[index].type
+        !=
+        FS_FILE
+    )
+    {
+        return
+            FS_RESULT_NOT_FILE;
+    }
+
+
+    if (
+        nodes[index].size
+        +
+        size
+        >
+        FS_MAX_FILE_SIZE
+    )
+    {
+        return
+            FS_RESULT_FILE_TOO_LARGE;
+    }
+
+
+    if (
+        size > 0
+    )
+    {
+        root_memcpy(
+            nodes[index].content
+            +
+            nodes[index].size,
+
+            data,
+            size
+        );
+    }
+
+
+    nodes[index].size +=
+        size;
+
+
+    nodes[index].content[
+        nodes[index].size
+    ] =
+        '\0';
 
 
     return

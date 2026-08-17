@@ -4,6 +4,21 @@
 #include "types.h"
 
 
+/*
+ * ============================================================
+ * FILESYSTEM LIMITS
+ * ============================================================
+ */
+
+#define FS_MAX_FILE_SIZE 4096
+
+
+/*
+ * ============================================================
+ * RESULTS
+ * ============================================================
+ */
+
 typedef enum
 {
     FS_RESULT_OK = 1,
@@ -20,7 +35,11 @@ typedef enum
 
     FS_RESULT_NO_SPACE = -6,
 
-    FS_RESULT_BUSY = -7
+    FS_RESULT_BUSY = -7,
+
+    FS_RESULT_NOT_FILE = -8,
+
+    FS_RESULT_FILE_TOO_LARGE = -9
 
 } FsResult;
 
@@ -53,7 +72,7 @@ const char* filesystem_current_directory(void);
 
 /*
  * ============================================================
- * LISTING / SEARCH
+ * LISTING
  * ============================================================
  */
 
@@ -110,6 +129,34 @@ FsResult filesystem_copy(
 FsResult filesystem_move(
     const char* source,
     const char* destination
+);
+
+
+/*
+ * ============================================================
+ * FILE CONTENT
+ * ============================================================
+ */
+
+FsResult filesystem_read_file(
+    const char* path,
+    char* output,
+    usize output_size,
+    usize* result_size
+);
+
+
+FsResult filesystem_write_file(
+    const char* path,
+    const char* data,
+    usize size
+);
+
+
+FsResult filesystem_append_file(
+    const char* path,
+    const char* data,
+    usize size
 );
 
 

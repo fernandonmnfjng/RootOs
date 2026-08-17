@@ -1,7 +1,7 @@
 [os]
 
 name = "RootOS"
-version = "0.36"
+version = "0.37"
 build = "Development Build"
 
 hostname = "RootOS"

@@ -48,6 +48,7 @@ CFLAGS = \
 	-Isource/font \
 	-Isource/display \
 	-Isource/terminal \
+	-Isource/editor \
 	-Isource/shell \
 	-Isource/lib
 
@@ -79,6 +80,7 @@ OBJECTS = \
 	$(OBJ)/keymap_latam.o \
 	$(OBJ)/rootinput.o \
 	$(OBJ)/filesystem.o \
+	$(OBJ)/rootedit.o \
 	$(OBJ)/shell.o
 
 
@@ -116,7 +118,7 @@ $(OBJ)/boot.o: source/arch/x86/boot.S | $(OBJ)
 
 
 # ============================================================
-# INTERRUPT ASSEMBLY STUBS
+# INTERRUPT STUBS
 # ============================================================
 
 $(OBJ)/interrupt_stubs.o: source/arch/x86/interrupt_stubs.S | $(OBJ)
@@ -140,7 +142,7 @@ $(OBJ)/kernel.o: source/kernel/kernel.c | $(OBJ)
 
 
 # ============================================================
-# INTERRUPT DESCRIPTOR TABLE
+# INTERRUPTS
 # ============================================================
 
 $(OBJ)/interrupts.o: source/arch/x86/interrupts.c | $(OBJ)
@@ -160,7 +162,7 @@ $(OBJ)/pic.o: source/arch/x86/pic.c | $(OBJ)
 
 
 # ============================================================
-# PIT TIMER
+# PIT
 # ============================================================
 
 $(OBJ)/pit.o: source/drivers/timer/pit.c | $(OBJ)
@@ -170,7 +172,7 @@ $(OBJ)/pit.o: source/drivers/timer/pit.c | $(OBJ)
 
 
 # ============================================================
-# ROOT TIME API
+# ROOT TIME
 # ============================================================
 
 $(OBJ)/time.o: source/kernel/time.c | $(OBJ)
@@ -180,7 +182,7 @@ $(OBJ)/time.o: source/kernel/time.c | $(OBJ)
 
 
 # ============================================================
-# SYSTEM CONFIGURATION
+# SYSTEM CONFIG
 # ============================================================
 
 $(OBJ)/system_config.o: source/config/system_config.c | $(OBJ)
@@ -190,7 +192,7 @@ $(OBJ)/system_config.o: source/config/system_config.c | $(OBJ)
 
 
 # ============================================================
-# ROOT LIBRARY - MEMORY
+# MEMORY
 # ============================================================
 
 $(OBJ)/memory.o: source/lib/memory.c | $(OBJ)
@@ -200,7 +202,7 @@ $(OBJ)/memory.o: source/lib/memory.c | $(OBJ)
 
 
 # ============================================================
-# ROOT LIBRARY - STRING
+# STRING
 # ============================================================
 
 $(OBJ)/string.o: source/lib/string.c | $(OBJ)
@@ -210,7 +212,7 @@ $(OBJ)/string.o: source/lib/string.c | $(OBJ)
 
 
 # ============================================================
-# ROOT LIBRARY - PATH
+# PATH
 # ============================================================
 
 $(OBJ)/path.o: source/lib/path.c | $(OBJ)
@@ -220,7 +222,7 @@ $(OBJ)/path.o: source/lib/path.c | $(OBJ)
 
 
 # ============================================================
-# ROOT LIBRARY - UNICODE
+# UNICODE
 # ============================================================
 
 $(OBJ)/unicode.o: source/lib/unicode.c | $(OBJ)
@@ -230,7 +232,7 @@ $(OBJ)/unicode.o: source/lib/unicode.c | $(OBJ)
 
 
 # ============================================================
-# FONT - GENERATE ROOTFONT
+# ROOTFONT GENERATOR
 # ============================================================
 
 $(BUILD)/rootfont.bin: assets/fonts/unifont_all-17.0.05.hex | $(BUILD)
@@ -240,7 +242,7 @@ $(BUILD)/rootfont.bin: assets/fonts/unifont_all-17.0.05.hex | $(BUILD)
 
 
 # ============================================================
-# FONT - ROOTFONT
+# ROOTFONT
 # ============================================================
 
 $(OBJ)/rootfont.o: source/font/rootfont.c | $(OBJ)
@@ -250,7 +252,7 @@ $(OBJ)/rootfont.o: source/font/rootfont.c | $(OBJ)
 
 
 # ============================================================
-# FONT - EMBED ROOTFONT
+# ROOTFONT DATA
 # ============================================================
 
 $(OBJ)/rootfont_data.o: $(BUILD)/rootfont.bin | $(OBJ)
@@ -284,7 +286,7 @@ $(OBJ)/terminal.o: source/terminal/terminal.c | $(OBJ)
 
 
 # ============================================================
-# INPUT - PS/2 CONTROLLER
+# PS/2
 # ============================================================
 
 $(OBJ)/ps2.o: source/drivers/input/ps2.c | $(OBJ)
@@ -294,7 +296,7 @@ $(OBJ)/ps2.o: source/drivers/input/ps2.c | $(OBJ)
 
 
 # ============================================================
-# INPUT - KEYBOARD
+# KEYBOARD
 # ============================================================
 
 $(OBJ)/keyboard.o: source/drivers/input/keyboard.c | $(OBJ)
@@ -304,7 +306,7 @@ $(OBJ)/keyboard.o: source/drivers/input/keyboard.c | $(OBJ)
 
 
 # ============================================================
-# INPUT - MOUSE
+# MOUSE
 # ============================================================
 
 $(OBJ)/mouse.o: source/drivers/input/mouse.c | $(OBJ)
@@ -314,7 +316,7 @@ $(OBJ)/mouse.o: source/drivers/input/mouse.c | $(OBJ)
 
 
 # ============================================================
-# INPUT - LATAM KEYMAP
+# LATAM KEYMAP
 # ============================================================
 
 $(OBJ)/keymap_latam.o: source/input/keymap_latam.c | $(OBJ)
@@ -324,7 +326,7 @@ $(OBJ)/keymap_latam.o: source/input/keymap_latam.c | $(OBJ)
 
 
 # ============================================================
-# INPUT - ROOTINPUT
+# ROOTINPUT
 # ============================================================
 
 $(OBJ)/rootinput.o: source/input/rootinput.c | $(OBJ)
@@ -341,6 +343,16 @@ $(OBJ)/filesystem.o: source/fs/filesystem.c | $(OBJ)
 >$(CC) $(CFLAGS) \
 	-c source/fs/filesystem.c \
 	-o $(OBJ)/filesystem.o
+
+
+# ============================================================
+# ROOTEDIT
+# ============================================================
+
+$(OBJ)/rootedit.o: source/editor/rootedit.c | $(OBJ)
+>$(CC) $(CFLAGS) \
+	-c source/editor/rootedit.c \
+	-o $(OBJ)/rootedit.o
 
 
 # ============================================================
@@ -365,8 +377,9 @@ $(BUILD)/kernel.elf: $(OBJECTS) linker.ld | $(BUILD)
 	$(OBJECTS) \
 	$(LIBGCC)
 
+
 # ============================================================
-# CREATE ROOTOS ISO
+# CREATE ISO
 # ============================================================
 
 $(BUILD)/RootOS.iso: $(BUILD)/kernel.elf
@@ -390,7 +403,7 @@ $(BUILD)/RootOS.iso: $(BUILD)/kernel.elf
 
 
 # ============================================================
-# VERIFY MULTIBOOT KERNEL
+# CHECK MULTIBOOT
 # ============================================================
 
 check: $(BUILD)/kernel.elf
@@ -402,7 +415,7 @@ check: $(BUILD)/kernel.elf
 
 
 # ============================================================
-# RUN ROOTOS IN QEMU
+# RUN
 # ============================================================
 
 run: $(BUILD)/RootOS.iso
@@ -414,7 +427,7 @@ run: $(BUILD)/RootOS.iso
 
 
 # ============================================================
-# CLEAN BUILD
+# CLEAN
 # ============================================================
 
 clean:
@@ -422,21 +435,21 @@ clean:
 
 
 # ============================================================
-# CLEAN ALIAS
+# CLEAR
 # ============================================================
 
 clear: clean
 
 
 # ============================================================
-# FULL REBUILD
+# REBUILD
 # ============================================================
 
 rebuild: clean all
 
 
 # ============================================================
-# PHONY TARGETS
+# PHONY
 # ============================================================
 
 .PHONY: \
