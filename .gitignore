@@ -1,0 +1,20 @@
+# RootOS build output
+/build/
+
+# Compiled files
+*.o
+*.elf
+*.iso
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
+
+# Temporary
+*.tmp
+*~
