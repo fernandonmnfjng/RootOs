@@ -1,4 +1,4 @@
-# Proyect OS
+# Proyect Root OS
 
 I am writing this at midnight, but you can already run it in
 --QEMU--
