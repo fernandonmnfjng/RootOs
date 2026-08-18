@@ -18,3 +18,6 @@ make clear
 make
 make check
 make run
+
+How to make and install package:
+WIP
