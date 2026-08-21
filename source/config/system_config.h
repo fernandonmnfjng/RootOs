@@ -16,9 +16,9 @@
 #define ROOTOS_NAME "RootOS"
 #define ROOTOS_VERSION_MAJOR 0
 #define ROOTOS_VERSION_MINOR 47
-#define ROOTOS_VERSION_PATCH 5
+#define ROOTOS_VERSION_PATCH 6
 
-#define ROOTOS_VERSION_STRING "0.47.5-unstable"
+#define ROOTOS_VERSION_STRING "0.47.6-unstable"
 
 #define ROOTOS_BUILD_TYPE "Development Build"
 

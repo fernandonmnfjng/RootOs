@@ -1,1086 +1,756 @@
-#include "rootdisplay.h"
+/*
+ * RootOS v0.47.6-1 UEFI/GOP framebuffer hotfix.
+ *
+ * The installer preserves the original RootOS rootdisplay.c as:
+ *
+ *     rootdisplay_legacy_impl.c
+ *
+ * We compile that implementation in this translation unit, renaming only its
+ * original rootdisplay_init().  All existing drawing, font, cursor, scrolling,
+ * selection and performance code therefore stays unchanged.
+ *
+ * The replacement rootdisplay_init() below adds the missing case for UEFI GOP
+ * framebuffers whose physical address/range is above 4 GiB.  RootOS remains an
+ * i386 kernel; a minimal PAE mapping exposes that physical range through a
+ * fixed 512 MiB virtual framebuffer window.
+ */
+
+#define rootdisplay_init rootdisplay_legacy_init
+#include "rootdisplay_legacy_impl.c"
+#undef rootdisplay_init
+
+#include "io.h"
 
 /* ============================================================
- * FRAMEBUFFER STATE
+ * EARLY SERIAL DIAGNOSTICS
  * ============================================================ */
 
-static volatile u8* framebuffer = NULL;
-static u32 display_width = 0;
-static u32 display_height = 0;
-static u32 display_pitch = 0;
-static u8 display_bpp = 0;
-static u8 display_bytes_per_pixel = 0;
-static bool display_available = false;
+#define ROOTOS_COM1_BASE 0x3F8u
+#define ROOTOS_SERIAL_SPIN_LIMIT 100000u
 
-/* Physical framebuffer channel layout. */
-static u8 red_position = 16;
-static u8 red_size = 8;
-static u8 green_position = 8;
-static u8 green_size = 8;
-static u8 blue_position = 0;
-static u8 blue_size = 8;
+static bool uefi_debug_serial_initialized = false;
 
-/* Nested bulk update depth. */
-static u32 update_depth = 0;
-
-/* ============================================================
- * SOFTWARE MOUSE CURSOR
- * ============================================================ */
-
-#define ROOT_CURSOR_WIDTH  12u
-#define ROOT_CURSOR_HEIGHT 19u
-
-static bool cursor_enabled = false;
-static bool cursor_drawn = false;
-static i32 cursor_x = 0;
-static i32 cursor_y = 0;
-
-static u32 cursor_background[
-    ROOT_CURSOR_WIDTH * ROOT_CURSOR_HEIGHT
-];
-
-/* B = black border, W = white fill, space = transparent. */
-static const char cursor_shape[ROOT_CURSOR_HEIGHT][ROOT_CURSOR_WIDTH + 1] =
+static void uefi_debug_serial_init(void)
 {
-    "B           ",
-    "BB          ",
-    "BWB         ",
-    "BWWB        ",
-    "BWWWB       ",
-    "BWWWWB      ",
-    "BWWWWWB     ",
-    "BWWWWWWB    ",
-    "BWWWWWWWB   ",
-    "BWWWWBBBBB  ",
-    "BWWBWB      ",
-    "BWB BWB     ",
-    "BB  BWB     ",
-    "B    BWB    ",
-    "     BWB    ",
-    "     BWB    ",
-    "      BWB   ",
-    "      BWB   ",
-    "       BB   "
-};
-
-/* ============================================================
- * COLOR CONVERSION
- * ============================================================ */
-
-static u32 channel_mask(u8 bits)
-{
-    if (bits == 0)
-        return 0;
-
-    if (bits >= 32)
-        return 0xFFFFFFFFu;
-
-    return (1u << bits) - 1u;
-}
-
-static u32 channel_pack(u8 value, u8 bits)
-{
-    if (bits == 0)
-        return 0;
-
-    if (bits == 8)
-        return value;
-
-    u32 maximum = channel_mask(bits);
-    return (((u32)value * maximum) + 127u) / 255u;
-}
-
-static u8 channel_unpack(u32 value, u8 bits)
-{
-    if (bits == 0)
-        return 0;
-
-    if (bits == 8)
-        return (u8)value;
-
-    u32 maximum = channel_mask(bits);
-    if (maximum == 0)
-        return 0;
-
-    return (u8)(((value * 255u) + (maximum / 2u)) / maximum);
-}
-
-static bool rgb_layout_valid(void)
-{
-    if (red_size == 0 || green_size == 0 || blue_size == 0)
-        return false;
-
-    if (red_size > 8 || green_size > 8 || blue_size > 8)
-        return false;
-
-    if ((u32)red_position + red_size > display_bpp)
-        return false;
-
-    if ((u32)green_position + green_size > display_bpp)
-        return false;
-
-    if ((u32)blue_position + blue_size > display_bpp)
-        return false;
-
-    u32 red_mask = channel_mask(red_size) << red_position;
-    u32 green_mask = channel_mask(green_size) << green_position;
-    u32 blue_mask = channel_mask(blue_size) << blue_position;
-
-    if ((red_mask & green_mask) != 0)
-        return false;
-
-    if ((red_mask & blue_mask) != 0)
-        return false;
-
-    if ((green_mask & blue_mask) != 0)
-        return false;
-
-    return true;
-}
-
-static u32 pack_physical_color(u32 color)
-{
-    u8 red = (u8)((color >> 16) & 0xFFu);
-    u8 green = (u8)((color >> 8) & 0xFFu);
-    u8 blue = (u8)(color & 0xFFu);
-
-    u32 packed = 0;
-    packed |= channel_pack(red, red_size) << red_position;
-    packed |= channel_pack(green, green_size) << green_position;
-    packed |= channel_pack(blue, blue_size) << blue_position;
-    return packed;
-}
-
-static u32 physical_rgb_mask(void)
-{
-    u32 mask = 0;
-    mask |= channel_mask(red_size) << red_position;
-    mask |= channel_mask(green_size) << green_position;
-    mask |= channel_mask(blue_size) << blue_position;
-    return mask;
-}
-
-static u32 unpack_physical_color(u32 packed)
-{
-    u32 red_raw =
-        (packed >> red_position) & channel_mask(red_size);
-
-    u32 green_raw =
-        (packed >> green_position) & channel_mask(green_size);
-
-    u32 blue_raw =
-        (packed >> blue_position) & channel_mask(blue_size);
-
-    return rootdisplay_rgb(
-        channel_unpack(red_raw, red_size),
-        channel_unpack(green_raw, green_size),
-        channel_unpack(blue_raw, blue_size)
-    );
-}
-
-/* ============================================================
- * RAW PIXEL ACCESS
- * ============================================================ */
-
-static void raw_put_packed_pixel(
-    u32 x,
-    u32 y,
-    u32 packed
-)
-{
-    if (!display_available || x >= display_width || y >= display_height)
+    if (uefi_debug_serial_initialized)
         return;
 
-    volatile u8* pixel =
-        framebuffer +
-        (y * display_pitch) +
-        (x * display_bytes_per_pixel);
+    outb((u16)(ROOTOS_COM1_BASE + 1u), 0x00u);
+    outb((u16)(ROOTOS_COM1_BASE + 3u), 0x80u);
+    outb((u16)(ROOTOS_COM1_BASE + 0u), 0x01u); /* 115200 baud */
+    outb((u16)(ROOTOS_COM1_BASE + 1u), 0x00u);
+    outb((u16)(ROOTOS_COM1_BASE + 3u), 0x03u); /* 8N1 */
+    outb((u16)(ROOTOS_COM1_BASE + 2u), 0xC7u);
+    outb((u16)(ROOTOS_COM1_BASE + 4u), 0x0Bu);
 
-    pixel[0] = (u8)(packed & 0xFFu);
-    pixel[1] = (u8)((packed >> 8) & 0xFFu);
-    pixel[2] = (u8)((packed >> 16) & 0xFFu);
-
-    if (display_bpp == 32)
-        pixel[3] = (u8)((packed >> 24) & 0xFFu);
+    uefi_debug_serial_initialized = true;
 }
 
-
-static void raw_put_pixel(u32 x, u32 y, u32 color)
+static void uefi_debug_putc(char value)
 {
-    raw_put_packed_pixel(
-        x,
-        y,
-        pack_physical_color(color)
-    );
+    uefi_debug_serial_init();
+
+    if (value == '\n')
+        uefi_debug_putc('\r');
+
+    for (u32 spin = 0; spin < ROOTOS_SERIAL_SPIN_LIMIT; spin++)
+    {
+        if ((inb((u16)(ROOTOS_COM1_BASE + 5u)) & 0x20u) != 0u)
+            break;
+    }
+
+    outb(ROOTOS_COM1_BASE, (u8)value);
 }
 
-static u32 raw_get_packed_pixel(u32 x, u32 y)
+static void uefi_debug_write(const char* text)
 {
-    if (!display_available || x >= display_width || y >= display_height)
-        return 0;
+    if (text == NULL)
+        return;
 
-    volatile u8* pixel =
-        framebuffer +
-        (y * display_pitch) +
-        (x * display_bytes_per_pixel);
-
-    u32 packed = (u32)pixel[0];
-    packed |= (u32)pixel[1] << 8;
-    packed |= (u32)pixel[2] << 16;
-
-    if (display_bpp == 32)
-        packed |= (u32)pixel[3] << 24;
-
-    return packed;
+    while (*text != '\0')
+        uefi_debug_putc(*text++);
 }
 
-static u32 raw_get_pixel(u32 x, u32 y)
+static void uefi_debug_line(const char* text)
 {
-    return unpack_physical_color(
-        raw_get_packed_pixel(x, y)
-    );
+    uefi_debug_write(text);
+    uefi_debug_putc('\n');
+}
+
+static char uefi_hex_digit(u8 value)
+{
+    value &= 0x0Fu;
+
+    return value < 10u
+        ? (char)('0' + value)
+        : (char)('A' + value - 10u);
+}
+
+static void uefi_debug_hex64(u64 value)
+{
+    uefi_debug_write("0x");
+
+    for (i32 shift = 60; shift >= 0; shift -= 4)
+        uefi_debug_putc(uefi_hex_digit((u8)(value >> (u32)shift)));
+}
+
+static void uefi_debug_u32(u32 value)
+{
+    char buffer[10];
+    u32 used = 0u;
+
+    if (value == 0u)
+    {
+        uefi_debug_putc('0');
+        return;
+    }
+
+    while (value != 0u && used < sizeof(buffer))
+    {
+        buffer[used++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    }
+
+    while (used != 0u)
+        uefi_debug_putc(buffer[--used]);
 }
 
 /* ============================================================
- * CURSOR INTERNALS
+ * PAE FRAMEBUFFER WINDOW
  * ============================================================ */
 
-static bool point_inside_cursor(
-    u32 x,
-    u32 y,
-    u32* local_x,
-    u32* local_y
+#define ROOTOS_FB_WINDOW_BASE 0x80000000u
+#define ROOTOS_FB_WINDOW_SIZE 0x20000000u /* 512 MiB */
+
+#define ROOTOS_PAE_PDPT_COUNT 4u
+#define ROOTOS_PAE_PDE_COUNT  512u
+
+#define ROOTOS_PAGE_SHIFT_2M 21u
+#define ROOTOS_PAGE_SIZE_2M  (1ULL << ROOTOS_PAGE_SHIFT_2M)
+#define ROOTOS_PAGE_MASK_2M  (ROOTOS_PAGE_SIZE_2M - 1ULL)
+
+#define ROOTOS_PAE_PRESENT (1ULL << 0)
+#define ROOTOS_PAE_RW      (1ULL << 1)
+#define ROOTOS_PAE_PWT     (1ULL << 3)
+#define ROOTOS_PAE_PCD     (1ULL << 4)
+#define ROOTOS_PAE_PS      (1ULL << 7)
+
+#define ROOTOS_PAE_PDE_ADDRESS_MASK  0x000FFFFFFFE00000ULL
+#define ROOTOS_PAE_PDPT_ADDRESS_MASK 0x000FFFFFFFFFF000ULL
+
+#define ROOTOS_CR0_PG  (1u << 31)
+#define ROOTOS_CR4_PSE (1u << 4)
+#define ROOTOS_CR4_PAE (1u << 5)
+
+static u64 uefi_pdpt[ROOTOS_PAE_PDPT_COUNT]
+    __attribute__((aligned(4096)));
+
+static u64 uefi_page_directories[
+    ROOTOS_PAE_PDPT_COUNT
+][
+    ROOTOS_PAE_PDE_COUNT
+]
+    __attribute__((aligned(4096)));
+
+static bool uefi_pae_active = false;
+
+static void uefi_cpuid(
+    u32 leaf,
+    u32* eax,
+    u32* ebx,
+    u32* ecx,
+    u32* edx
 )
 {
-    if (!cursor_drawn)
+    u32 a;
+    u32 b;
+    u32 c;
+    u32 d;
+
+    __asm__ volatile(
+        "cpuid"
+        : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+        : "a"(leaf), "c"(0u)
+    );
+
+    if (eax != NULL) *eax = a;
+    if (ebx != NULL) *ebx = b;
+    if (ecx != NULL) *ecx = c;
+    if (edx != NULL) *edx = d;
+}
+
+static bool uefi_cpu_supports_pae(void)
+{
+    u32 maximum_leaf = 0u;
+    u32 features_edx = 0u;
+
+    uefi_cpuid(
+        0u,
+        &maximum_leaf,
+        NULL,
+        NULL,
+        NULL
+    );
+
+    if (maximum_leaf < 1u)
         return false;
 
-    if ((i32)x < cursor_x || (i32)y < cursor_y)
-        return false;
+    uefi_cpuid(
+        1u,
+        NULL,
+        NULL,
+        NULL,
+        &features_edx
+    );
 
-    i32 relative_x = (i32)x - cursor_x;
-    i32 relative_y = (i32)y - cursor_y;
+    /* CPUID.01H:EDX.PSE[3], PAE[6]. */
+    const u32 required =
+        (1u << 3) |
+        (1u << 6);
 
+    return (features_edx & required) == required;
+}
+
+static u32 uefi_read_cr0(void)
+{
+    u32 value;
+
+    __asm__ volatile(
+        "mov %%cr0, %0"
+        : "=r"(value)
+    );
+
+    return value;
+}
+
+static u32 uefi_read_cr4(void)
+{
+    u32 value;
+
+    __asm__ volatile(
+        "mov %%cr4, %0"
+        : "=r"(value)
+    );
+
+    return value;
+}
+
+static void uefi_write_cr0(u32 value)
+{
+    __asm__ volatile(
+        "mov %0, %%cr0"
+        :
+        : "r"(value)
+        : "memory"
+    );
+}
+
+static void uefi_write_cr3(u32 value)
+{
+    __asm__ volatile(
+        "mov %0, %%cr3"
+        :
+        : "r"(value)
+        : "memory"
+    );
+}
+
+static void uefi_write_cr4(u32 value)
+{
+    __asm__ volatile(
+        "mov %0, %%cr4"
+        :
+        : "r"(value)
+        : "memory"
+    );
+}
+
+static void uefi_build_identity_map(void)
+{
+    for (
+        u32 pdpt_index = 0u;
+        pdpt_index < ROOTOS_PAE_PDPT_COUNT;
+        pdpt_index++
+    )
+    {
+        u64 directory_physical =
+            (u64)(u32)(usize)&uefi_page_directories[pdpt_index][0];
+
+        uefi_pdpt[pdpt_index] =
+            (directory_physical & ROOTOS_PAE_PDPT_ADDRESS_MASK) |
+            ROOTOS_PAE_PRESENT;
+
+        for (
+            u32 pde_index = 0u;
+            pde_index < ROOTOS_PAE_PDE_COUNT;
+            pde_index++
+        )
+        {
+            u64 page_number =
+                (u64)pdpt_index *
+                (u64)ROOTOS_PAE_PDE_COUNT +
+                (u64)pde_index;
+
+            u64 physical =
+                page_number <<
+                ROOTOS_PAGE_SHIFT_2M;
+
+            uefi_page_directories[pdpt_index][pde_index] =
+                (physical & ROOTOS_PAE_PDE_ADDRESS_MASK) |
+                ROOTOS_PAE_PRESENT |
+                ROOTOS_PAE_RW |
+                ROOTOS_PAE_PS;
+        }
+    }
+}
+
+static bool uefi_install_framebuffer_window(
+    u64 physical_address,
+    usize byte_length,
+    volatile u8** mapped_address
+)
+{
     if (
-        relative_x < 0 ||
-        relative_y < 0 ||
-        relative_x >= (i32)ROOT_CURSOR_WIDTH ||
-        relative_y >= (i32)ROOT_CURSOR_HEIGHT
+        mapped_address == NULL ||
+        byte_length == 0u
     )
     {
         return false;
     }
 
-    if (local_x != NULL)
-        *local_x = (u32)relative_x;
+    u64 page_offset =
+        physical_address &
+        ROOTOS_PAGE_MASK_2M;
 
-    if (local_y != NULL)
-        *local_y = (u32)relative_y;
+    u64 aligned_physical =
+        physical_address -
+        page_offset;
+
+    u64 span =
+        page_offset +
+        (u64)byte_length;
+
+    if (span < (u64)byte_length)
+        return false;
+
+    u64 page_count64 =
+        (span + ROOTOS_PAGE_MASK_2M) >>
+        ROOTOS_PAGE_SHIFT_2M;
+
+    u32 maximum_pages =
+        ROOTOS_FB_WINDOW_SIZE >>
+        ROOTOS_PAGE_SHIFT_2M;
+
+    if (
+        page_count64 == 0u ||
+        page_count64 > (u64)maximum_pages
+    )
+    {
+        return false;
+    }
+
+    u64 last_page =
+        aligned_physical +
+        ((page_count64 - 1u) <<
+        ROOTOS_PAGE_SHIFT_2M);
+
+    if (
+        (aligned_physical &
+            ~ROOTOS_PAE_PDE_ADDRESS_MASK) != 0u ||
+        (last_page &
+            ~ROOTOS_PAE_PDE_ADDRESS_MASK) != 0u
+    )
+    {
+        return false;
+    }
+
+    const u32 pdpt_index =
+        ROOTOS_FB_WINDOW_BASE >>
+        30;
+
+    const u32 first_pde =
+        (
+            ROOTOS_FB_WINDOW_BASE >>
+            ROOTOS_PAGE_SHIFT_2M
+        ) &
+        0x1FFu;
+
+    const u32 page_count =
+        (u32)page_count64;
+
+    if (
+        first_pde +
+        page_count >
+        ROOTOS_PAE_PDE_COUNT
+    )
+    {
+        return false;
+    }
+
+    for (u32 index = 0u; index < page_count; index++)
+    {
+        u64 physical =
+            aligned_physical +
+            ((u64)index <<
+            ROOTOS_PAGE_SHIFT_2M);
+
+        /*
+         * Conservative uncached framebuffer mapping.  RootOS can later add
+         * PAT/write-combining as a separate performance change.
+         */
+        uefi_page_directories[
+            pdpt_index
+        ][
+            first_pde + index
+        ] =
+            (physical & ROOTOS_PAE_PDE_ADDRESS_MASK) |
+            ROOTOS_PAE_PRESENT |
+            ROOTOS_PAE_RW |
+            ROOTOS_PAE_PWT |
+            ROOTOS_PAE_PCD |
+            ROOTOS_PAE_PS;
+    }
+
+    *mapped_address =
+        (volatile u8*)(usize)(
+            ROOTOS_FB_WINDOW_BASE +
+            (u32)page_offset
+        );
 
     return true;
 }
 
-static void cursor_restore_background(void)
+static bool uefi_map_high_framebuffer(
+    u64 physical_address,
+    usize byte_length,
+    volatile u8** mapped_address
+)
 {
-    if (!cursor_drawn)
-        return;
-
-    for (u32 y = 0; y < ROOT_CURSOR_HEIGHT; y++)
+    if (!uefi_cpu_supports_pae())
     {
-        for (u32 x = 0; x < ROOT_CURSOR_WIDTH; x++)
-        {
-            i32 screen_x = cursor_x + (i32)x;
-            i32 screen_y = cursor_y + (i32)y;
-
-            if (
-                screen_x < 0 ||
-                screen_y < 0 ||
-                screen_x >= (i32)display_width ||
-                screen_y >= (i32)display_height
-            )
-            {
-                continue;
-            }
-
-            u32 index = y * ROOT_CURSOR_WIDTH + x;
-            raw_put_pixel(
-                (u32)screen_x,
-                (u32)screen_y,
-                cursor_background[index]
-            );
-        }
+        uefi_debug_line(
+            "[video] ERROR: CPU lacks PAE/PSE"
+        );
+        return false;
     }
 
-    cursor_drawn = false;
-}
-
-static void cursor_capture_background(void)
-{
-    for (u32 y = 0; y < ROOT_CURSOR_HEIGHT; y++)
+    if (
+        (uefi_read_cr0() & ROOTOS_CR0_PG) != 0u &&
+        !uefi_pae_active
+    )
     {
-        for (u32 x = 0; x < ROOT_CURSOR_WIDTH; x++)
-        {
-            u32 index = y * ROOT_CURSOR_WIDTH + x;
-            i32 screen_x = cursor_x + (i32)x;
-            i32 screen_y = cursor_y + (i32)y;
-
-            if (
-                screen_x < 0 ||
-                screen_y < 0 ||
-                screen_x >= (i32)display_width ||
-                screen_y >= (i32)display_height
-            )
-            {
-                cursor_background[index] = 0;
-                continue;
-            }
-
-            cursor_background[index] =
-                raw_get_pixel((u32)screen_x, (u32)screen_y);
-        }
-    }
-}
-
-static void cursor_draw(void)
-{
-    if (!cursor_enabled || !display_available || update_depth != 0)
-        return;
-
-    u32 black = rootdisplay_rgb(0, 0, 0);
-    u32 white = rootdisplay_rgb(255, 255, 255);
-
-    for (u32 y = 0; y < ROOT_CURSOR_HEIGHT; y++)
-    {
-        for (u32 x = 0; x < ROOT_CURSOR_WIDTH; x++)
-        {
-            char shape = cursor_shape[y][x];
-            if (shape == ' ')
-                continue;
-
-            i32 screen_x = cursor_x + (i32)x;
-            i32 screen_y = cursor_y + (i32)y;
-
-            if (
-                screen_x < 0 ||
-                screen_y < 0 ||
-                screen_x >= (i32)display_width ||
-                screen_y >= (i32)display_height
-            )
-            {
-                continue;
-            }
-
-            raw_put_pixel(
-                (u32)screen_x,
-                (u32)screen_y,
-                shape == 'B' ? black : white
-            );
-        }
+        uefi_debug_line(
+            "[video] ERROR: unknown paging already active"
+        );
+        return false;
     }
 
-    cursor_drawn = true;
+    if (!uefi_pae_active)
+    {
+        uefi_build_identity_map();
+
+        if (
+            !uefi_install_framebuffer_window(
+                physical_address,
+                byte_length,
+                mapped_address
+            )
+        )
+        {
+            return false;
+        }
+
+        u32 cr4 =
+            uefi_read_cr4();
+
+        cr4 |=
+            ROOTOS_CR4_PAE |
+            ROOTOS_CR4_PSE;
+
+        uefi_write_cr4(cr4);
+
+        uefi_write_cr3(
+            (u32)(usize)&uefi_pdpt[0]
+        );
+
+        uefi_write_cr0(
+            uefi_read_cr0() |
+            ROOTOS_CR0_PG
+        );
+
+        /*
+         * Current RootOS addresses remain identity mapped. A short branch
+         * serializes instruction execution after paging becomes active.
+         */
+        __asm__ volatile(
+            "jmp 1f\n"
+            "1:"
+            :
+            :
+            : "memory"
+        );
+
+        uefi_pae_active = true;
+    }
+    else
+    {
+        if (
+            !uefi_install_framebuffer_window(
+                physical_address,
+                byte_length,
+                mapped_address
+            )
+        )
+        {
+            return false;
+        }
+
+        uefi_write_cr3(
+            (u32)(usize)&uefi_pdpt[0]
+        );
+    }
+
+    return true;
 }
 
 /* ============================================================
- * PUBLIC API
+ * ROOTDISPLAY INITIALIZATION
  * ============================================================ */
 
 void rootdisplay_init(const MultibootInfo* multiboot)
 {
     framebuffer = NULL;
-    display_width = 0;
-    display_height = 0;
-    display_pitch = 0;
-    display_bpp = 0;
-    display_bytes_per_pixel = 0;
+    display_width = 0u;
+    display_height = 0u;
+    display_pitch = 0u;
+    display_bpp = 0u;
+    display_bytes_per_pixel = 0u;
     display_available = false;
 
     cursor_enabled = false;
     cursor_drawn = false;
     cursor_x = 0;
     cursor_y = 0;
-    update_depth = 0;
+    update_depth = 0u;
 
-    if (multiboot == NULL)
-        return;
-
-    if ((multiboot->flags & MULTIBOOT_INFO_FRAMEBUFFER) == 0)
-        return;
-
-    if (multiboot->framebuffer_type != 1)
-        return;
-
-    if (multiboot->framebuffer_addr > 0xFFFFFFFFULL)
-        return;
-
-    if (
-        multiboot->framebuffer_width == 0 ||
-        multiboot->framebuffer_height == 0
-    )
-    {
-        return;
-    }
-
-    if (
-        multiboot->framebuffer_bpp != 24 &&
-        multiboot->framebuffer_bpp != 32
-    )
-    {
-        return;
-    }
-
-    framebuffer =
-        (volatile u8*)(usize)multiboot->framebuffer_addr;
-
-    display_width = multiboot->framebuffer_width;
-    display_height = multiboot->framebuffer_height;
-    display_pitch = multiboot->framebuffer_pitch;
-    display_bpp = multiboot->framebuffer_bpp;
-    display_bytes_per_pixel = display_bpp / 8;
-
-    if (
-        display_pitch <
-        display_width * display_bytes_per_pixel
-    )
-    {
-        framebuffer = NULL;
-        return;
-    }
-
-    red_position = multiboot->framebuffer_red_field_position;
-    red_size = multiboot->framebuffer_red_mask_size;
-    green_position = multiboot->framebuffer_green_field_position;
-    green_size = multiboot->framebuffer_green_mask_size;
-    blue_position = multiboot->framebuffer_blue_field_position;
-    blue_size = multiboot->framebuffer_blue_mask_size;
-
-    /*
-     * Defensive fallback. QEMU std normally provides 8:8:8 RGB.
-     * If the Multiboot RGB metadata is malformed, never let one
-     * missing channel turn white into yellow/red.
-     */
-    if (!rgb_layout_valid())
-    {
-        red_position = 16;
-        red_size = 8;
-        green_position = 8;
-        green_size = 8;
-        blue_position = 0;
-        blue_size = 8;
-    }
-
-    display_available = true;
-}
-
-bool rootdisplay_ready(void)
-{
-    return display_available;
-}
-
-u32 rootdisplay_width(void)
-{
-    return display_width;
-}
-
-u32 rootdisplay_height(void)
-{
-    return display_height;
-}
-
-u32 rootdisplay_rgb(u8 red, u8 green, u8 blue)
-{
-    return
-        ((u32)red << 16) |
-        ((u32)green << 8) |
-        (u32)blue;
-}
-
-void rootdisplay_begin_update(void)
-{
-    if (!display_available)
-        return;
-
-    if (update_depth == 0 && cursor_drawn)
-        cursor_restore_background();
-
-    update_depth++;
-}
-
-void rootdisplay_end_update(void)
-{
-    if (!display_available || update_depth == 0)
-        return;
-
-    update_depth--;
-
-    if (update_depth == 0 && cursor_enabled)
-    {
-        cursor_capture_background();
-        cursor_draw();
-    }
-}
-
-void rootdisplay_put_pixel(u32 x, u32 y, u32 color)
-{
-    if (!display_available || x >= display_width || y >= display_height)
-        return;
-
-    if (update_depth != 0)
-    {
-        raw_put_pixel(x, y, color);
-        return;
-    }
-
-    u32 local_x;
-    u32 local_y;
-
-    if (point_inside_cursor(x, y, &local_x, &local_y))
-    {
-        u32 index = local_y * ROOT_CURSOR_WIDTH + local_x;
-        cursor_background[index] = color;
-
-        if (cursor_shape[local_y][local_x] == ' ')
-            raw_put_pixel(x, y, color);
-
-        return;
-    }
-
-    raw_put_pixel(x, y, color);
-}
-
-u32 rootdisplay_get_pixel(u32 x, u32 y)
-{
-    if (!display_available || x >= display_width || y >= display_height)
-        return 0;
-
-    u32 local_x;
-    u32 local_y;
-
-    if (point_inside_cursor(x, y, &local_x, &local_y))
-    {
-        return cursor_background[
-            local_y * ROOT_CURSOR_WIDTH + local_x
-        ];
-    }
-
-    return raw_get_pixel(x, y);
-}
-
-void rootdisplay_draw_mono_bitmap(
-    u32 x,
-    u32 y,
-    u32 width,
-    u32 height,
-    const u8* bitmap,
-    u32 stride_bytes,
-    u32 foreground,
-    u32 background,
-    bool opaque
-)
-{
-    if (
-        !display_available ||
-        bitmap == NULL ||
-        width == 0 ||
-        height == 0 ||
-        stride_bytes == 0 ||
-        x >= display_width ||
-        y >= display_height
-    )
-    {
-        return;
-    }
-
-    u32 draw_width = width;
-    u32 draw_height = height;
-
-    if (draw_width > display_width - x)
-        draw_width = display_width - x;
-
-    if (draw_height > display_height - y)
-        draw_height = display_height - y;
-
-    u32 foreground_packed = pack_physical_color(foreground);
-    u32 background_packed = pack_physical_color(background);
-
-    rootdisplay_begin_update();
-
-    for (u32 py = 0; py < draw_height; py++)
-    {
-        const u8* row = bitmap + (usize)py * stride_bytes;
-
-        for (u32 px = 0; px < draw_width; px++)
-        {
-            u8 byte = row[px / 8u];
-            u8 bit = (u8)(7u - (px % 8u));
-            bool set = (byte & (u8)(1u << bit)) != 0;
-
-            if (set)
-            {
-                raw_put_packed_pixel(
-                    x + px,
-                    y + py,
-                    foreground_packed
-                );
-            }
-            else if (opaque)
-            {
-                raw_put_packed_pixel(
-                    x + px,
-                    y + py,
-                    background_packed
-                );
-            }
-        }
-    }
-
-    rootdisplay_end_update();
-}
-
-void rootdisplay_fill_rect(
-    u32 x,
-    u32 y,
-    u32 width,
-    u32 height,
-    u32 color
-)
-{
-    if (
-        !display_available ||
-        width == 0 ||
-        height == 0 ||
-        x >= display_width ||
-        y >= display_height
-    )
-    {
-        return;
-    }
-
-    u32 end_x = x + width;
-    u32 end_y = y + height;
-
-    if (end_x < x || end_x > display_width)
-        end_x = display_width;
-
-    if (end_y < y || end_y > display_height)
-        end_y = display_height;
-
-    rootdisplay_begin_update();
-
-    u32 packed = pack_physical_color(color);
-
-    for (u32 py = y; py < end_y; py++)
-    {
-        for (u32 px = x; px < end_x; px++)
-            raw_put_packed_pixel(px, py, packed);
-    }
-
-    rootdisplay_end_update();
-}
-
-void rootdisplay_invert_rect(
-    u32 x,
-    u32 y,
-    u32 width,
-    u32 height
-)
-{
-    if (
-        !display_available ||
-        width == 0 ||
-        height == 0 ||
-        x >= display_width ||
-        y >= display_height
-    )
-    {
-        return;
-    }
-
-    u32 end_x = x + width;
-    u32 end_y = y + height;
-
-    if (end_x < x || end_x > display_width)
-        end_x = display_width;
-
-    if (end_y < y || end_y > display_height)
-        end_y = display_height;
-
-    /*
-     * Selection highlighting is hot-path rendering. Invert the
-     * framebuffer's packed RGB bits directly; do not unpack and
-     * repack every pixel.
-     */
-    u32 mask = physical_rgb_mask();
-
-    rootdisplay_begin_update();
-
-    for (u32 py = y; py < end_y; py++)
-    {
-        for (u32 px = x; px < end_x; px++)
-        {
-            u32 packed = raw_get_packed_pixel(px, py);
-            raw_put_packed_pixel(px, py, packed ^ mask);
-        }
-    }
-
-    rootdisplay_end_update();
-}
-
-static void framebuffer_copy_forward(
-    volatile u8* destination,
-    const volatile u8* source,
-    usize bytes
-)
-{
-    /*
-     * Hot framebuffer path. Copy cache-line sized chunks with explicit
-     * 32-bit stores instead of byte-at-a-time MMIO writes. The loop is
-     * manually unrolled so freestanding -O2 does not need libc or SIMD.
-     */
-    if (((((usize)destination) | ((usize)source)) & 3u) == 0)
-    {
-        volatile u32* dst32 = (volatile u32*)destination;
-        const volatile u32* src32 = (const volatile u32*)source;
-        usize words = bytes / 4u;
-
-        while (words >= 8u)
-        {
-            dst32[0] = src32[0];
-            dst32[1] = src32[1];
-            dst32[2] = src32[2];
-            dst32[3] = src32[3];
-            dst32[4] = src32[4];
-            dst32[5] = src32[5];
-            dst32[6] = src32[6];
-            dst32[7] = src32[7];
-            dst32 += 8;
-            src32 += 8;
-            words -= 8u;
-        }
-
-        while (words != 0u)
-        {
-            *dst32++ = *src32++;
-            words--;
-        }
-
-        usize copied = (bytes / 4u) * 4u;
-        destination += copied;
-        source += copied;
-        bytes -= copied;
-    }
-
-    while (bytes != 0u)
-    {
-        *destination++ = *source++;
-        bytes--;
-    }
-}
-
-static void framebuffer_copy_backward(
-    volatile u8* destination,
-    const volatile u8* source,
-    usize bytes
-)
-{
-    if (bytes == 0u)
-        return;
-
-    if (((((usize)destination) | ((usize)source) | bytes) & 3u) == 0)
-    {
-        volatile u32* dst32 =
-            (volatile u32*)(destination + bytes);
-        const volatile u32* src32 =
-            (const volatile u32*)(source + bytes);
-        usize words = bytes / 4u;
-
-        while (words >= 8u)
-        {
-            dst32[-1] = src32[-1];
-            dst32[-2] = src32[-2];
-            dst32[-3] = src32[-3];
-            dst32[-4] = src32[-4];
-            dst32[-5] = src32[-5];
-            dst32[-6] = src32[-6];
-            dst32[-7] = src32[-7];
-            dst32[-8] = src32[-8];
-            dst32 -= 8;
-            src32 -= 8;
-            words -= 8u;
-        }
-
-        while (words != 0u)
-        {
-            --dst32;
-            --src32;
-            *dst32 = *src32;
-            words--;
-        }
-
-        return;
-    }
-
-    while (bytes != 0u)
-    {
-        bytes--;
-        destination[bytes] = source[bytes];
-    }
-}
-
-static void framebuffer_fill_rows(
-    u32 start_y,
-    u32 row_count,
-    u32 packed
-)
-{
-    if (row_count == 0u || start_y >= display_height)
-        return;
-
-    if (row_count > display_height - start_y)
-        row_count = display_height - start_y;
-
-    if (display_bytes_per_pixel == 4u)
-    {
-        for (u32 row = 0; row < row_count; row++)
-        {
-            volatile u32* dst =
-                (volatile u32*)(framebuffer +
-                    (usize)(start_y + row) * display_pitch);
-            u32 remaining = display_width;
-
-            while (remaining >= 8u)
-            {
-                dst[0] = packed;
-                dst[1] = packed;
-                dst[2] = packed;
-                dst[3] = packed;
-                dst[4] = packed;
-                dst[5] = packed;
-                dst[6] = packed;
-                dst[7] = packed;
-                dst += 8;
-                remaining -= 8u;
-            }
-
-            while (remaining != 0u)
-            {
-                *dst++ = packed;
-                remaining--;
-            }
-        }
-
-        return;
-    }
-
-    for (u32 y = start_y; y < start_y + row_count; y++)
-    {
-        for (u32 x = 0; x < display_width; x++)
-            raw_put_packed_pixel(x, y, packed);
-    }
-}
-
-void rootdisplay_scroll_up(
-    u32 pixel_rows,
-    u32 fill_color
-)
-{
-    if (!display_available || pixel_rows == 0)
-        return;
-
-    if (pixel_rows >= display_height)
-    {
-        rootdisplay_clear(fill_color);
-        return;
-    }
-
-    rootdisplay_begin_update();
-
-    usize source_offset =
-        (usize)pixel_rows * (usize)display_pitch;
-
-    usize bytes_to_move =
-        ((usize)display_height - pixel_rows) *
-        (usize)display_pitch;
-
-    framebuffer_copy_forward(
-        framebuffer,
-        framebuffer + source_offset,
-        bytes_to_move
+    uefi_debug_line(
+        "[video] RootOS v0.47.6-1 rootdisplay init"
     );
 
-    u32 start_y = display_height - pixel_rows;
-    u32 packed_fill = pack_physical_color(fill_color);
-
-    for (u32 y = start_y; y < display_height; y++)
+    if (multiboot == NULL)
     {
-        for (u32 x = 0; x < display_width; x++)
-            raw_put_packed_pixel(x, y, packed_fill);
+        uefi_debug_line(
+            "[video] ERROR: no Multiboot information"
+        );
+        return;
     }
 
-    rootdisplay_end_update();
-}
-
-
-void rootdisplay_shift_vertical(
-    u32 region_y,
-    u32 region_height,
-    i32 pixel_delta,
-    u32 fill_color
-)
-{
     if (
-        !display_available ||
-        region_height == 0u ||
-        pixel_delta == 0 ||
-        region_y >= display_height
+        (multiboot->flags &
+        MULTIBOOT_INFO_FRAMEBUFFER) == 0u
     )
     {
-        return;
-    }
-
-    if (region_height > display_height - region_y)
-        region_height = display_height - region_y;
-
-    u32 amount =
-        (u32)(pixel_delta < 0 ? -pixel_delta : pixel_delta);
-
-    if (amount >= region_height)
-    {
-        rootdisplay_fill_rect(
-            0,
-            region_y,
-            display_width,
-            region_height,
-            fill_color
+        uefi_debug_line(
+            "[video] ERROR: framebuffer flag missing"
         );
         return;
     }
 
-    rootdisplay_begin_update();
+    uefi_debug_write(
+        "[video] GOP/Multiboot fb="
+    );
+    uefi_debug_hex64(
+        multiboot->framebuffer_addr
+    );
+    uefi_debug_write(" ");
+    uefi_debug_u32(
+        multiboot->framebuffer_width
+    );
+    uefi_debug_putc('x');
+    uefi_debug_u32(
+        multiboot->framebuffer_height
+    );
+    uefi_debug_putc('x');
+    uefi_debug_u32(
+        multiboot->framebuffer_bpp
+    );
+    uefi_debug_write(" pitch=");
+    uefi_debug_u32(
+        multiboot->framebuffer_pitch
+    );
+    uefi_debug_putc('\n');
 
-    usize pitch = (usize)display_pitch;
-    usize bytes_to_move =
-        (usize)(region_height - amount) * pitch;
-
-    if (pixel_delta < 0)
+    if (multiboot->framebuffer_type != 1u)
     {
-        /* Content moves upward. */
-        volatile u8* destination =
-            framebuffer + (usize)region_y * pitch;
-        const volatile u8* source =
-            framebuffer + (usize)(region_y + amount) * pitch;
-
-        framebuffer_copy_forward(
-            destination,
-            source,
-            bytes_to_move
+        uefi_debug_line(
+            "[video] ERROR: framebuffer is not direct RGB"
         );
+        return;
+    }
 
-        framebuffer_fill_rows(
-            region_y + region_height - amount,
-            amount,
-            pack_physical_color(fill_color)
+    if (
+        multiboot->framebuffer_width == 0u ||
+        multiboot->framebuffer_height == 0u
+    )
+    {
+        uefi_debug_line(
+            "[video] ERROR: zero framebuffer dimensions"
+        );
+        return;
+    }
+
+    if (
+        multiboot->framebuffer_bpp != 24u &&
+        multiboot->framebuffer_bpp != 32u
+    )
+    {
+        uefi_debug_line(
+            "[video] ERROR: unsupported framebuffer bpp"
+        );
+        return;
+    }
+
+    display_width =
+        multiboot->framebuffer_width;
+
+    display_height =
+        multiboot->framebuffer_height;
+
+    display_pitch =
+        multiboot->framebuffer_pitch;
+
+    display_bpp =
+        multiboot->framebuffer_bpp;
+
+    display_bytes_per_pixel =
+        display_bpp /
+        8u;
+
+    u64 minimum_pitch =
+        (u64)display_width *
+        (u64)display_bytes_per_pixel;
+
+    if ((u64)display_pitch < minimum_pitch)
+    {
+        uefi_debug_line(
+            "[video] ERROR: framebuffer pitch too small"
+        );
+        return;
+    }
+
+    u64 framebuffer_bytes =
+        (u64)display_pitch *
+        (u64)display_height;
+
+    if (
+        framebuffer_bytes == 0u ||
+        framebuffer_bytes > 0xFFFFFFFFULL
+    )
+    {
+        uefi_debug_line(
+            "[video] ERROR: invalid framebuffer byte size"
+        );
+        return;
+    }
+
+    if (multiboot->framebuffer_addr == 0u)
+    {
+        uefi_debug_line(
+            "[video] ERROR: framebuffer address is zero"
+        );
+        return;
+    }
+
+    u64 framebuffer_last =
+        multiboot->framebuffer_addr +
+        framebuffer_bytes -
+        1u;
+
+    if (
+        framebuffer_last <
+        multiboot->framebuffer_addr
+    )
+    {
+        uefi_debug_line(
+            "[video] ERROR: framebuffer address overflow"
+        );
+        return;
+    }
+
+    if (framebuffer_last <= 0xFFFFFFFFULL)
+    {
+        framebuffer =
+            (volatile u8*)(usize)
+            multiboot->framebuffer_addr;
+
+        uefi_debug_line(
+            "[video] direct 32-bit framebuffer mapping"
         );
     }
     else
     {
-        /* Content moves downward. Overlap requires a backwards copy. */
-        volatile u8* destination =
-            framebuffer + (usize)(region_y + amount) * pitch;
-        const volatile u8* source =
-            framebuffer + (usize)region_y * pitch;
-
-        framebuffer_copy_backward(
-            destination,
-            source,
-            bytes_to_move
+        uefi_debug_line(
+            "[video] framebuffer above 4 GiB -> PAE mapping"
         );
 
-        framebuffer_fill_rows(
-            region_y,
-            amount,
-            pack_physical_color(fill_color)
+        if (
+            !uefi_map_high_framebuffer(
+                multiboot->framebuffer_addr,
+                (usize)framebuffer_bytes,
+                &framebuffer
+            )
+        )
+        {
+            framebuffer = NULL;
+
+            uefi_debug_line(
+                "[video] ERROR: PAE framebuffer mapping failed"
+            );
+            return;
+        }
+
+        uefi_debug_line(
+            "[video] high framebuffer mapped at 0x80000000 window"
         );
     }
 
-    rootdisplay_end_update();
-}
+    red_position =
+        multiboot->framebuffer_red_field_position;
 
-void rootdisplay_clear(u32 color)
-{
-    rootdisplay_fill_rect(
-        0,
-        0,
-        display_width,
-        display_height,
-        color
+    red_size =
+        multiboot->framebuffer_red_mask_size;
+
+    green_position =
+        multiboot->framebuffer_green_field_position;
+
+    green_size =
+        multiboot->framebuffer_green_mask_size;
+
+    blue_position =
+        multiboot->framebuffer_blue_field_position;
+
+    blue_size =
+        multiboot->framebuffer_blue_mask_size;
+
+    if (!rgb_layout_valid())
+    {
+        uefi_debug_line(
+            "[video] WARNING: invalid RGB masks; using 8:8:8"
+        );
+
+        red_position = 16u;
+        red_size = 8u;
+
+        green_position = 8u;
+        green_size = 8u;
+
+        blue_position = 0u;
+        blue_size = 8u;
+    }
+
+    display_available = true;
+
+    uefi_debug_line(
+        "[video] framebuffer ready"
     );
-}
-
-void rootdisplay_cursor_enable(bool enabled)
-{
-    if (!display_available)
-    {
-        cursor_enabled = false;
-        cursor_drawn = false;
-        return;
-    }
-
-    if (!enabled)
-    {
-        if (cursor_drawn)
-            cursor_restore_background();
-
-        cursor_enabled = false;
-        return;
-    }
-
-    if (cursor_enabled)
-        return;
-
-    cursor_enabled = true;
-
-    if (update_depth == 0)
-    {
-        cursor_capture_background();
-        cursor_draw();
-    }
-}
-
-void rootdisplay_cursor_move(i32 x, i32 y)
-{
-    if (!display_available)
-        return;
-
-    if (x < 0)
-        x = 0;
-
-    if (y < 0)
-        y = 0;
-
-    if (x >= (i32)display_width)
-        x = (i32)display_width - 1;
-
-    if (y >= (i32)display_height)
-        y = (i32)display_height - 1;
-
-    if (x == cursor_x && y == cursor_y)
-        return;
-
-    if (cursor_drawn)
-        cursor_restore_background();
-
-    cursor_x = x;
-    cursor_y = y;
-
-    if (cursor_enabled && update_depth == 0)
-    {
-        cursor_capture_background();
-        cursor_draw();
-    }
-}
-
-bool rootdisplay_cursor_visible(void)
-{
-    return cursor_enabled && cursor_drawn;
 }
