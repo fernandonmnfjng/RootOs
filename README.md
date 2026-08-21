@@ -1,30 +1,106 @@
-# RootOs v0.47-6-1 (UNSTABLE)
+# RootOs v0.47.6-3 (UNSTABLE)
 
-RootOs is a free, open-source meta-operating system designed from scratch as a structural foundation to help you build and deploy your own custom operating system.
+This is the third repair of the RootOS 0.47.6 development version.
 
-Currently, the custom kernel runs reliably inside the **QEMU** emulator. Native support and boot stability for physical bare-metal hardware (both legacy BIOS and modern UEFI) are actively under development and targeted for the upcoming **v0.5** release.
+## What this repair fixes
 
-## v0.47.6-1 UEFI/GOP hotfix
+### 1. Brute-force framebuffer performance fix
 
-This development hotfix keeps the existing RootDisplay/RootFont graphical terminal and adds support for UEFI GOP framebuffers whose physical address is above the 32-bit 4 GiB boundary.
+RootOS already keeps a logical terminal cell buffer and already batches command
+output. It also has incremental scrollback rendering. The remaining expensive
+path was lower down: scrolling and cursor background operations were reading
+and moving the physical GOP framebuffer itself.
 
-RootOS remains an i386 kernel. A minimal PAE framebuffer window is enabled only when required by the GOP physical address.
+On real hardware, framebuffer reads can be dramatically slower than cached RAM.
 
-The GRUB configuration prefers `1024x768x32` with automatic fallback and includes a dedicated UEFI video diagnostic boot entry.
+v0.47.6-3 therefore adds a 16 MiB cached shadow framebuffer:
 
----
+    terminal / cursor / selection
+               |
+               v
+        normal cached RAM
+               |
+        damage rectangle
+               |
+               v
+      sequential WC writes
+               |
+               v
+         physical GOP FB
 
-## Prerequisites (Development Environment)
+The established RootDisplay renderer remains the backend. Its `framebuffer`
+pointer is redirected to cached RAM whenever the mode fits the shadow buffer.
+
+At the end of a RootDisplay update transaction, only the accumulated damaged
+rectangle is copied to the real framebuffer.
+
+This combines the two useful strategies already used by mature/open systems:
+
+- logical console operations and batched scrolling instead of repainting the
+  whole terminal for every character;
+- buffered/deferred rendering so slow device memory is primarily written
+  sequentially instead of read/modified constantly.
+
+The previous PAT Write-Combining mapping remains enabled when supported.
+
+Modes larger than the 16 MiB shadow buffer do not fail to boot; they fall back
+to the previous direct renderer.
+
+### 2. Software mouse cursor is no longer conditional on PS/2
+
+Previously RootInput disabled the graphical pointer and re-enabled it only if
+the PS/2 mouse initialization succeeded.
+
+That means a modern USB-only PC could have a perfectly working framebuffer but
+no cursor would be drawn at all.
+
+v0.47.6-3 always displays the RootOS software cursor when RootDisplay is ready.
+PS/2 remains a movement backend when available.
+
+USB HID movement is a separate feature layer planned for the 0.48 line.
+
+### 3. USB host controller actually starts in normal boot
+
+The current xHCI driver separates discovery from hardware start:
+
+    xhci_init()   -> discover/register controller
+    xhci_start()  -> reset/start controller and enumerate root ports
+
+Normal boot previously called only `xhci_init()`. The shell could poll USB
+forever, but there was no running controller until the user manually issued
+`usb start`.
+
+v0.47.6-3 starts xHCI automatically after USB Mass Storage and RNDIS listeners
+are registered.
+
+The start is non-fatal:
+
+- no xHCI controller -> continue boot;
+- xHCI initialization failure -> continue boot;
+- at least one running controller -> enumerate USB and service deferred device
+  notifications.
+
+Safe mode still skips hardware discovery.
+
+## Important current limits
+
+This repair does NOT pretend that all USB hardware support is complete.
+
+Current remaining architectural work includes:
+
+- USB HID keyboard/mouse Interrupt-IN endpoints;
+- HID Boot Protocol and later generic HID report parsing;
+- USB hub traversal;
+- xHCI BARs above 4 GiB through a generic RootIO/ioremap layer;
+- EHCI/UHCI/OHCI for older USB-only machines.
+
+Those are functionality additions and belong to the 0.48 development line,
+rather than another 0.47.6 repair suffix.
+
+## Build
 
 ```bash
-sudo apt update
-sudo apt install build-essential qemu-system-x86 grub-pc-bin xorriso mtools
-```
-
-## Compilation
-
-```bash
-make clean
+make clear
 make
 make check
 make run
@@ -33,10 +109,8 @@ make run
 ## Physical USB update
 
 ```bash
-lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS
+lsblk -o NAME,PATH,TYPE,SIZE,MODEL,TRAN,MOUNTPOINTS
 make usb-update DEVICE=/dev/sdX
 ```
 
-## License
-
-This project is released under the **CC0 1.0 Universal (Creative Commons Zero)** Public Domain Dedication.
+Use the whole USB disk, not a partition.

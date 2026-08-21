@@ -7,18 +7,21 @@
  * IDENTIDAD DEL SISTEMA
  * ============================================================
  *
- * Por ahora estos valores son compile-time.
+ * Versionado RootOS:
  *
- * Más adelante compOs podrá generar este archivo
- * automáticamente basándose en build.toml.
+ *     major.minor.patch-fix
+ *
+ * El sufijo -fix identifica una correccion de la misma version base.
  */
 
 #define ROOTOS_NAME "RootOS"
+
 #define ROOTOS_VERSION_MAJOR 0
 #define ROOTOS_VERSION_MINOR 47
 #define ROOTOS_VERSION_PATCH 6
+#define ROOTOS_VERSION_FIX   3
 
-#define ROOTOS_VERSION_STRING "0.47.6-unstable"
+#define ROOTOS_VERSION_STRING "0.47.6-3-unstable"
 
 #define ROOTOS_BUILD_TYPE "Development Build"
 
