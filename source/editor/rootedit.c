@@ -14,8 +14,10 @@
 #include "path.h"
 
 
-#define ROOTEDIT_MAX_CODEPOINTS \
-    FS_MAX_FILE_SIZE
+#define ROOTEDIT_MAX_CODEPOINTS 4096u
+
+#define ROOTEDIT_MAX_FILE_BYTES \
+    (ROOTEDIT_MAX_CODEPOINTS * 4u)
 
 
 #define ROOTEDIT_BODY_START_ROW 3
@@ -41,12 +43,12 @@ static RootCodepoint editor_buffer[
 
 
 static char editor_file_bytes[
-    FS_MAX_FILE_SIZE + 1
+    ROOTEDIT_MAX_FILE_BYTES + 1u
 ];
 
 
 static char editor_save_bytes[
-    FS_MAX_FILE_SIZE + 1
+    ROOTEDIT_MAX_FILE_BYTES + 1u
 ];
 
 
@@ -2402,7 +2404,7 @@ static FsResult editor_save(void)
             +
             count
             >
-            FS_MAX_FILE_SIZE
+            ROOTEDIT_MAX_FILE_BYTES
         )
         {
             editor_save_error =

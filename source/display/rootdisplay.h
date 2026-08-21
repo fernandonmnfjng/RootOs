@@ -52,6 +52,17 @@ void rootdisplay_scroll_up(
     u32 fill_color
 );
 
+/*
+ * Move a full-width vertical framebuffer region without rerasterizing it.
+ * Negative delta moves pixels up; positive delta moves them down.
+ */
+void rootdisplay_shift_vertical(
+    u32 region_y,
+    u32 region_height,
+    i32 pixel_delta,
+    u32 fill_color
+);
+
 void rootdisplay_clear(u32 color);
 
 void rootdisplay_cursor_enable(bool enabled);

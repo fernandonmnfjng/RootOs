@@ -18,7 +18,7 @@
 
 #define TERMINAL_MAX_COLS 256u
 #define TERMINAL_MAX_ROWS 128u
-#define TERMINAL_SCROLLBACK_LINES 256u
+#define TERMINAL_SCROLLBACK_LINES 1024u
 #define TERMINAL_OUTPUT_DEFER_THRESHOLD 192u
 
 #define TERMINAL_CONTINUATION 0xFFFFFFFFu
@@ -47,7 +47,7 @@ static RootCodepoint terminal_cells[
     TERMINAL_MAX_COLS
 ];
 
-/* Fixed memory ring: at most 256 historical lines. */
+/* Fixed memory ring: at most 1024 historical lines. */
 static RootCodepoint scrollback[
     TERMINAL_SCROLLBACK_LINES
 ][
@@ -232,6 +232,8 @@ static void graphics_render_live_cell(u32 column, u32 row)
     graphics_draw_glyph(codepoint, column, row);
 }
 
+static void graphics_erase_cursor(void);
+
 /* ============================================================
  * SCROLLBACK / VISIBLE ROW MAPPING
  * ============================================================ */
@@ -275,7 +277,6 @@ static void graphics_render_row_data(
     u32 screen_row
 )
 {
-    /* graphics_redraw_view() already cleared the whole framebuffer. */
     if (row_data == NULL)
         return;
 
@@ -309,6 +310,80 @@ static void graphics_redraw_view(void)
         graphics_render_row_data(visible_row_data(row), row);
 
     rootdisplay_end_update();
+}
+
+/*
+ * Fast scrollback renderer. Instead of clearing and rerasterizing the full
+ * screen, move the already-rendered framebuffer and rasterize only the newly
+ * exposed terminal rows.
+ *
+ * line_delta > 0: viewport moved into older history, pixels move down.
+ * line_delta < 0: viewport moved toward live output, pixels move up.
+ */
+static void graphics_shift_view(i32 line_delta)
+{
+    if (!terminal_graphics || line_delta == 0)
+        return;
+
+    u32 amount =
+        (u32)(line_delta < 0 ? -line_delta : line_delta);
+
+    if (amount >= terminal_rows)
+    {
+        graphics_redraw_view();
+        return;
+    }
+
+    rootdisplay_begin_update();
+
+    i32 pixel_delta =
+        line_delta * (i32)TERMINAL_CELL_HEIGHT;
+
+    rootdisplay_shift_vertical(
+        0u,
+        terminal_rows * TERMINAL_CELL_HEIGHT,
+        pixel_delta,
+        terminal_background
+    );
+
+    if (line_delta > 0)
+    {
+        for (u32 row = 0; row < amount; row++)
+            graphics_render_row_data(visible_row_data(row), row);
+    }
+    else
+    {
+        u32 first = terminal_rows - amount;
+
+        for (u32 row = first; row < terminal_rows; row++)
+            graphics_render_row_data(visible_row_data(row), row);
+    }
+
+    rootdisplay_end_update();
+}
+
+static void terminal_set_scrollback_offset(u32 new_offset)
+{
+    if (new_offset > scrollback_count)
+        new_offset = scrollback_count;
+
+    if (new_offset == scrollback_view_offset)
+        return;
+
+    terminal_selection_clear();
+
+    u32 old_offset = scrollback_view_offset;
+
+    /* The live text cursor is part of the framebuffer, not terminal_cells. */
+    if (old_offset == 0u && new_offset != 0u)
+        graphics_erase_cursor();
+
+    i32 delta =
+        (i32)new_offset - (i32)old_offset;
+
+    scrollback_view_offset = new_offset;
+
+    graphics_shift_view(delta);
 }
 
 static void scrollback_push_top_row(void)
@@ -546,9 +621,7 @@ static void terminal_return_live(void)
     if (scrollback_view_offset == 0)
         return;
 
-    terminal_selection_clear();
-    scrollback_view_offset = 0;
-    graphics_redraw_view();
+    terminal_set_scrollback_offset(0u);
 }
 
 static void terminal_begin_update(bool clear_selection)
@@ -1275,14 +1348,15 @@ void terminal_scrollback_up(u32 lines)
     if (!terminal_graphics || scrollback_count == 0 || lines == 0)
         return;
 
-    terminal_selection_clear();
+    u32 available = scrollback_count - scrollback_view_offset;
+    u32 actual = lines > available ? available : lines;
 
-    if (lines > scrollback_count - scrollback_view_offset)
-        scrollback_view_offset = scrollback_count;
-    else
-        scrollback_view_offset += lines;
+    if (actual == 0u)
+        return;
 
-    graphics_redraw_view();
+    terminal_set_scrollback_offset(
+        scrollback_view_offset + actual
+    );
 }
 
 void terminal_scrollback_down(u32 lines)
@@ -1290,14 +1364,17 @@ void terminal_scrollback_down(u32 lines)
     if (!terminal_graphics || lines == 0)
         return;
 
-    terminal_selection_clear();
+    u32 actual =
+        lines > scrollback_view_offset
+        ? scrollback_view_offset
+        : lines;
 
-    if (lines >= scrollback_view_offset)
-        scrollback_view_offset = 0;
-    else
-        scrollback_view_offset -= lines;
+    if (actual == 0u)
+        return;
 
-    graphics_redraw_view();
+    terminal_set_scrollback_offset(
+        scrollback_view_offset - actual
+    );
 
     if (scrollback_view_offset == 0)
     {
@@ -1312,9 +1389,7 @@ void terminal_scrollback_bottom(void)
     if (scrollback_view_offset == 0)
         return;
 
-    terminal_selection_clear();
-    scrollback_view_offset = 0;
-    graphics_redraw_view();
+    terminal_set_scrollback_offset(0u);
 
     if (terminal_graphics)
     {

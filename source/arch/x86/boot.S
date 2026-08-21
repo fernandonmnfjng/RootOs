@@ -1,127 +1,113 @@
 /*
- * ============================================================
- * ROOTOS MULTIBOOT HEADER
- * ============================================================
+ * RootOS x86 Multiboot v1 entry.
+ *
+ * Real-hardware rules followed here:
+ *   - advertise a linear framebuffer to GRUB;
+ *   - preserve Multiboot EAX/EBX before touching AX;
+ *   - install our own GDT before reloading any segment register;
+ *   - clear DF because Multiboot leaves most EFLAGS bits undefined;
+ *   - create and align our own stack before entering C.
  */
 
-.set ALIGN,    1<<0
-.set MEMINFO,  1<<1
-.set VIDEO,    1<<2
+.set MB_MAGIC,    0x1BADB002
+.set MB_ALIGN,    (1 << 0)
+.set MB_MEMINFO,  (1 << 1)
+.set MB_VIDEO,    (1 << 2)
+.set MB_FLAGS,    (MB_ALIGN | MB_MEMINFO | MB_VIDEO)
+.set MB_CHECKSUM, -(MB_MAGIC + MB_FLAGS)
 
-.set FLAGS,    ALIGN | MEMINFO | VIDEO
+.set GDT_CODE_SEL, 0x08
+.set GDT_DATA_SEL, 0x10
 
-.set MAGIC,    0x1BADB002
-.set CHECKSUM, -(MAGIC + FLAGS)
-
-
-.section .multiboot,"a"
-
+.section .multiboot,"a",@progbits
 .align 4
+.long MB_MAGIC
+.long MB_FLAGS
+.long MB_CHECKSUM
 
-.long MAGIC
-.long FLAGS
-.long CHECKSUM
+/* Multiboot v1 fixed address slots (unused because bit 16 is clear). */
+.long 0                  /* header_addr */
+.long 0                  /* load_addr */
+.long 0                  /* load_end_addr */
+.long 0                  /* bss_end_addr */
+.long 0                  /* entry_addr */
 
-
-/*
- * ============================================================
- * GRAPHICS REQUEST
- * ============================================================
- *
- * mode_type = 0
- *     framebuffer lineal
- *
- * width  = 1024
- * height = 768
- * depth  = 32 bits
- *
- * Es una preferencia.
- * GRUB puede entregar otro modo compatible.
- */
-
-.long 0
-.long 1024
-.long 768
-.long 32
-
+/* Graphics preference. Zero dimensions mean: any linear mode is acceptable. */
+.long 0                  /* mode_type = linear graphics */
+.long 0                  /* width = no preference */
+.long 0                  /* height = no preference */
+.long 0                  /* depth = no preference */
 
 /*
- * ============================================================
- * STACK
- * ============================================================
+ * Known flat 32-bit GDT.
+ * Multiboot guarantees usable segment registers at entry, but the exact
+ * selectors are undefined and GDTR itself may be invalid.  RootOS owns the
+ * descriptor table before C/interrupt code can make assumptions about 0x08
+ * and 0x10.
  */
+.section .rodata
+.align 8
+gdt_start:
+    .quad 0x0000000000000000      /* null */
+    .quad 0x00CF9A000000FFFF      /* 0x08: base=0 limit=4GiB code */
+    .quad 0x00CF92000000FFFF      /* 0x10: base=0 limit=4GiB data */
+gdt_end:
+
+gdt_descriptor:
+    .word gdt_end - gdt_start - 1
+    .long gdt_start
 
 .section .bss
-
 .align 16
-
 stack_bottom:
-
-.skip 16384
-
+.skip 32768
 stack_top:
 
-
-/*
- * ============================================================
- * ENTRY
- * ============================================================
- */
-
 .section .text
-
 .global _start
-
 .type _start, @function
-
-
 .extern kernel_main
 
-
 _start:
+    cli
 
-    /*
-     * Crear stack.
-     */
+    /* Preserve Multiboot arguments before AX is used for segment selectors. */
+    mov %eax, %esi
+    mov %ebx, %edi
+
+    /* The Direction Flag is undefined on Multiboot entry. */
+    cld
+
+    /* Establish descriptor state that RootOS itself controls. */
+    lgdt gdt_descriptor
+    ljmp $GDT_CODE_SEL, $gdt_ready
+
+gdt_ready:
+    mov $GDT_DATA_SEL, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
+    mov %ax, %ss
+
+    /* Own stack, 16-byte aligned. */
     mov $stack_top, %esp
-
+    and $-16, %esp
+    xor %ebp, %ebp
 
     /*
-     * Al entrar mediante Multiboot:
-     *
-     * EAX = magic 0x2BADB002
-     * EBX = dirección de MultibootInfo
-     *
-     * kernel_main(
-     *     magic,
-     *     multiboot_info
-     * )
-     *
-     * cdecl coloca argumentos
-     * de derecha a izquierda.
+     * i386 SysV: keep ESP 16-byte aligned immediately before CALL.
+     * cdecl: kernel_main(magic, info) => push info, then magic.
      */
-
-    push %ebx
-    push %eax
-
+    sub $8, %esp
+    push %edi
+    push %esi
     call kernel_main
 
-
-    /*
-     * Si retorna:
-     */
-    add $8, %esp
-
-
-hang:
-
+1:
     cli
     hlt
-
-    jmp hang
-
+    jmp 1b
 
 .size _start, . - _start
-
-
 .section .note.GNU-stack,"",@progbits

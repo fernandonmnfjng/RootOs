@@ -10,7 +10,7 @@
  * ============================================================
  */
 
-#define FS_MAX_FILE_SIZE 4096
+#define FS_MAX_FILE_SIZE (64u * 1024u)
 
 
 /*
@@ -39,7 +39,9 @@ typedef enum
 
     FS_RESULT_NOT_FILE = -8,
 
-    FS_RESULT_FILE_TOO_LARGE = -9
+    FS_RESULT_FILE_TOO_LARGE = -9,
+
+    FS_RESULT_IO_ERROR = -10
 
 } FsResult;
 
@@ -51,6 +53,21 @@ typedef enum
  */
 
 void filesystem_init(void);
+
+
+/*
+ * ============================================================
+ * BACKEND INFORMATION
+ * ============================================================
+ */
+
+bool filesystem_is_persistent(void);
+
+bool filesystem_storage_faulted(void);
+
+usize filesystem_node_count(void);
+
+usize filesystem_free_node_count(void);
 
 
 /*
@@ -173,6 +190,12 @@ bool filesystem_exists(
 
 bool filesystem_is_directory(
     const char* path
+);
+
+
+bool filesystem_file_size(
+    const char* path,
+    usize* size
 );
 
 

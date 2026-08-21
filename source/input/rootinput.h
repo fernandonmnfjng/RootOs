@@ -27,7 +27,9 @@ typedef enum
     ROOT_INPUT_MOUSE_CLICK,
     ROOT_INPUT_MOUSE_DOUBLE_CLICK,
 
-    ROOT_INPUT_MOUSE_DRAG
+    ROOT_INPUT_MOUSE_DRAG,
+
+    ROOT_INPUT_MOUSE_WHEEL
 
 } RootInputEventType;
 
@@ -97,6 +99,9 @@ typedef struct
 
     i32 mouse_dx;
     i32 mouse_dy;
+
+    /* Positive = wheel up, negative = wheel down. */
+    i32 mouse_wheel;
 
     RootMouseButton button;
 

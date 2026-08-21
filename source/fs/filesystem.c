@@ -6,7 +6,9 @@
 #include "memory.h"
 #include "string.h"
 #include "path.h"
+#include "heap.h"
 
+#include "rootfs_disk.h"
 #include "system_config.h"
 
 
@@ -16,7 +18,7 @@
  * ============================================================
  */
 
-#define FS_MAX_NODES 256
+#define FS_MAX_NODES ROOTFS_DISK_MAX_NODES
 
 
 /*
@@ -43,23 +45,13 @@ typedef struct
         ROOT_PATH_MAX
     ];
 
-
-    /*
-     * ========================================================
-     * FILE CONTENT
-     * ========================================================
-     *
-     * Por ahora cada archivo dispone de hasta 4096 bytes.
-     *
-     * En v0.38/v0.39 eliminaremos este límite fijo usando
-     * memoria dinámica y bloques.
-     */
-
     usize size;
 
-    char content[
-        FS_MAX_FILE_SIZE + 1
-    ];
+    /*
+     * Only used by the emergency RAM backend.
+     * Persistent RootFS files live on disk and keep this NULL.
+     */
+    char* ram_content;
 
 } FsNode;
 
@@ -69,15 +61,14 @@ typedef struct
  * INITIAL FILESYSTEM
  * ============================================================
  *
- * Esto representa el RootOS base.
- *
- * filesystem_init() lo copia a la tabla mutable.
+ * These are the directories that belong to the RootOS base.
+ * Desktop/Music/Pictures/Videos/etc. are intentionally omitted:
+ * desktop/user-directory packages may create them later.
  */
 
 typedef struct
 {
     const char* path;
-
     FsType type;
 
 } InitialFsNode;
@@ -92,33 +83,28 @@ static const InitialFsNode initial_nodes[] =
 
     { "/home",                              FS_DIRECTORY },
     { "/home/user",                         FS_DIRECTORY },
-
-    { "/home/user/projects",                FS_DIRECTORY },
-    { "/home/user/projects/os",             FS_DIRECTORY },
-
+    { "/home/user/Documents",               FS_DIRECTORY },
+    { "/home/user/Downloads",               FS_DIRECTORY },
+    { "/home/user/Projects",                FS_DIRECTORY },
+    { "/home/user/bin",                     FS_DIRECTORY },
     { "/home/user/readme.txt",              FS_FILE },
 
-    { "/home/user/bin",                     FS_DIRECTORY },
-    { "/home/user/bin/demo",                FS_FILE },
-
     { "/system",                            FS_DIRECTORY },
-
     { "/system/bin",                        FS_DIRECTORY },
     { "/system/bin/shell",                  FS_FILE },
-
     { "/system/drivers",                    FS_DIRECTORY },
-
     { "/system/fonts",                      FS_DIRECTORY },
     { "/system/fonts/unifont-17.0.05.otf",  FS_FILE },
-
     { "/system/libraries",                  FS_DIRECTORY },
-
+    { "/system/services",                   FS_DIRECTORY },
+    { "/system/apps",                       FS_DIRECTORY },
     { "/system/version.txt",                FS_FILE },
 
     { "/config",                            FS_DIRECTORY },
     { "/config/users",                      FS_DIRECTORY },
     { "/config/shell",                      FS_DIRECTORY },
     { "/config/system",                     FS_DIRECTORY },
+    { "/config/services",                   FS_DIRECTORY },
 
     { "/packages",                          FS_DIRECTORY },
 
@@ -126,7 +112,10 @@ static const InitialFsNode initial_nodes[] =
 
     { "/var",                               FS_DIRECTORY },
     { "/var/log",                           FS_DIRECTORY },
-    { "/var/log/kernel.log",                FS_FILE }
+    { "/var/log/kernel.log",                FS_FILE },
+    { "/var/cache",                         FS_DIRECTORY },
+    { "/var/cache/packages",                FS_DIRECTORY },
+    { "/var/run",                           FS_DIRECTORY }
 };
 
 
@@ -136,7 +125,7 @@ static const InitialFsNode initial_nodes[] =
 
 /*
  * ============================================================
- * MUTABLE FILESYSTEM
+ * MUTABLE METADATA CACHE
  * ============================================================
  */
 
@@ -148,6 +137,102 @@ static FsNode nodes[
 static char current_directory[
     ROOT_PATH_MAX
 ];
+
+
+/*
+ * true when the ROOTFS42 disk volume is mounted and all writes are persistent.
+ */
+static bool filesystem_persistent_backend = false;
+
+
+/*
+ * Set when a valid-looking backend could not be loaded/written correctly.
+ * In that case RootOS falls back to RAM rather than risking unknown storage.
+ */
+static bool filesystem_storage_error = false;
+
+
+/*
+ * Shared scratch space. The kernel is currently single-threaded, so these
+ * buffers avoid large stack allocations without creating permanent 1 MiB
+ * per-file storage as the old RAM filesystem did.
+ */
+static char fs_io_buffer[
+    FS_MAX_FILE_SIZE + 1
+];
+
+
+static char fs_copy_buffer[
+    FS_MAX_FILE_SIZE + 1
+];
+
+
+/*
+ * ============================================================
+ * NODE MEMORY HELPERS
+ * ============================================================
+ */
+
+static void release_ram_content(
+    u32 index
+)
+{
+    if (
+        index >= FS_MAX_NODES
+    )
+    {
+        return;
+    }
+
+
+    if (
+        nodes[index].ram_content != NULL
+    )
+    {
+        root_free(
+            nodes[index].ram_content
+        );
+
+        nodes[index].ram_content = NULL;
+    }
+}
+
+
+static void reset_node(
+    u32 index
+)
+{
+    if (
+        index >= FS_MAX_NODES
+    )
+    {
+        return;
+    }
+
+
+    release_ram_content(
+        index
+    );
+
+
+    root_memzero(
+        &nodes[index],
+        sizeof(nodes[index])
+    );
+}
+
+
+static void reset_all_nodes(void)
+{
+    for (
+        u32 i = 0;
+        i < FS_MAX_NODES;
+        i++
+    )
+    {
+        reset_node(i);
+    }
+}
 
 
 /*
@@ -217,12 +302,6 @@ static int find_free_node(void)
 }
 
 
-/*
- * ============================================================
- * FREE NODE COUNT
- * ============================================================
- */
-
 static usize count_free_nodes(void)
 {
     usize count = 0;
@@ -244,6 +323,366 @@ static usize count_free_nodes(void)
 
 
     return count;
+}
+
+
+/*
+ * ============================================================
+ * ROOTFS DISK CONVERSION
+ * ============================================================
+ */
+
+static RootFsDiskType fs_type_to_disk(
+    FsType type
+)
+{
+    return
+        type == FS_DIRECTORY
+        ?
+        ROOTFS_DISK_DIRECTORY
+        :
+        ROOTFS_DISK_FILE;
+}
+
+
+static FsType disk_type_to_fs(
+    RootFsDiskType type
+)
+{
+    return
+        type == ROOTFS_DISK_DIRECTORY
+        ?
+        FS_DIRECTORY
+        :
+        FS_FILE;
+}
+
+
+static bool persist_node(
+    u32 index
+)
+{
+    if (
+        !filesystem_persistent_backend
+    )
+    {
+        return true;
+    }
+
+
+    if (
+        index >= FS_MAX_NODES
+        ||
+        !nodes[index].used
+    )
+    {
+        return false;
+    }
+
+
+    RootFsDiskNode disk_node;
+
+
+    root_memzero(
+        &disk_node,
+        sizeof(disk_node)
+    );
+
+
+    disk_node.used = true;
+
+    disk_node.type =
+        fs_type_to_disk(
+            nodes[index].type
+        );
+
+    disk_node.size =
+        nodes[index].size;
+
+
+    if (
+        root_strlcpy(
+            disk_node.path,
+            nodes[index].path,
+            sizeof(disk_node.path)
+        )
+        >=
+        sizeof(disk_node.path)
+    )
+    {
+        return false;
+    }
+
+
+    if (
+        !rootfs_disk_write_node(
+            index,
+            &disk_node
+        )
+    )
+    {
+        filesystem_storage_error = true;
+        return false;
+    }
+
+
+    return true;
+}
+
+
+static bool clear_persisted_node(
+    u32 index
+)
+{
+    if (
+        !filesystem_persistent_backend
+    )
+    {
+        return true;
+    }
+
+
+    if (
+        !rootfs_disk_clear_node(
+            index
+        )
+    )
+    {
+        filesystem_storage_error = true;
+        return false;
+    }
+
+
+    return true;
+}
+
+
+/*
+ * ============================================================
+ * RAM BACKEND
+ * ============================================================
+ */
+
+static bool ram_write_file(
+    u32 index,
+    const void* data,
+    usize size
+)
+{
+    if (
+        index >= FS_MAX_NODES
+        ||
+        !nodes[index].used
+        ||
+        nodes[index].type != FS_FILE
+        ||
+        size > FS_MAX_FILE_SIZE
+        ||
+        (
+            size > 0
+            &&
+            data == NULL
+        )
+    )
+    {
+        return false;
+    }
+
+
+    char* replacement = NULL;
+
+
+    if (
+        size > 0
+    )
+    {
+        replacement =
+            (char*)root_malloc(
+                size + 1
+            );
+
+
+        if (
+            replacement == NULL
+        )
+        {
+            return false;
+        }
+
+
+        root_memcpy(
+            replacement,
+            data,
+            size
+        );
+
+
+        replacement[size] = '\0';
+    }
+
+
+    release_ram_content(
+        index
+    );
+
+
+    nodes[index].ram_content =
+        replacement;
+
+    nodes[index].size =
+        size;
+
+
+    return true;
+}
+
+
+static bool ram_read_file(
+    u32 index,
+    void* output,
+    usize capacity,
+    usize* result_size
+)
+{
+    if (
+        result_size != NULL
+    )
+    {
+        *result_size = 0;
+    }
+
+
+    if (
+        index >= FS_MAX_NODES
+        ||
+        output == NULL
+        ||
+        !nodes[index].used
+        ||
+        nodes[index].type != FS_FILE
+        ||
+        nodes[index].size > capacity
+    )
+    {
+        return false;
+    }
+
+
+    if (
+        nodes[index].size > 0
+    )
+    {
+        if (
+            nodes[index].ram_content == NULL
+        )
+        {
+            return false;
+        }
+
+
+        root_memcpy(
+            output,
+            nodes[index].ram_content,
+            nodes[index].size
+        );
+    }
+
+
+    if (
+        result_size != NULL
+    )
+    {
+        *result_size =
+            nodes[index].size;
+    }
+
+
+    return true;
+}
+
+
+/*
+ * ============================================================
+ * FILE BACKEND
+ * ============================================================
+ */
+
+static bool backend_read_file(
+    u32 index,
+    void* output,
+    usize capacity,
+    usize* result_size
+)
+{
+    if (
+        filesystem_persistent_backend
+    )
+    {
+        if (
+            !rootfs_disk_read_file(
+                index,
+                output,
+                capacity,
+                result_size
+            )
+        )
+        {
+            filesystem_storage_error = true;
+            return false;
+        }
+
+
+        return true;
+    }
+
+
+    return
+        ram_read_file(
+            index,
+            output,
+            capacity,
+            result_size
+        );
+}
+
+
+static bool backend_write_file(
+    u32 index,
+    const void* data,
+    usize size
+)
+{
+    if (
+        filesystem_persistent_backend
+    )
+    {
+        if (
+            !rootfs_disk_write_file(
+                index,
+                data,
+                size
+            )
+        )
+        {
+            filesystem_storage_error = true;
+            return false;
+        }
+
+
+        nodes[index].size =
+            size;
+
+
+        return true;
+    }
+
+
+    return
+        ram_write_file(
+            index,
+            data,
+            size
+        );
 }
 
 
@@ -284,6 +723,11 @@ static FsResult add_node_absolute(
     }
 
 
+    reset_node(
+        (u32)index
+    );
+
+
     if (
         root_strlcpy(
             nodes[index].path,
@@ -302,17 +746,29 @@ static FsResult add_node_absolute(
     nodes[index].type =
         type;
 
-
     nodes[index].size =
         0;
 
-
-    nodes[index].content[0] =
-        '\0';
-
+    nodes[index].ram_content =
+        NULL;
 
     nodes[index].used =
         true;
+
+
+    if (
+        !persist_node(
+            (u32)index
+        )
+    )
+    {
+        reset_node(
+            (u32)index
+        );
+
+        return
+            FS_RESULT_IO_ERROR;
+    }
 
 
     return
@@ -324,16 +780,6 @@ static FsResult add_node_absolute(
  * ============================================================
  * PATH RELATION
  * ============================================================
- *
- * true:
- *
- * base:
- *     /home/user
- *
- * candidate:
- *     /home/user
- *     /home/user/a
- *     /home/user/a/b
  */
 
 static bool path_is_inside(
@@ -341,9 +787,6 @@ static bool path_is_inside(
     const char* candidate
 )
 {
-    /*
-     * Root contiene todo.
-     */
     if (
         root_streq(
             base,
@@ -451,11 +894,6 @@ static bool get_parent_path(
     }
 
 
-    /*
-     * /archivo
-     *
-     * parent = /
-     */
     if (
         length <= 1
     )
@@ -467,18 +905,9 @@ static bool get_parent_path(
     }
 
 
-    /*
-     * /home/user/file
-     *
-     * ->
-     *
-     * /home/user
-     */
-
     output[
         length - 1
-    ] =
-        '\0';
+    ] = '\0';
 
 
     return true;
@@ -541,12 +970,13 @@ static bool append_component(
     }
 
 
-    if (!root)
+    if (
+        !root
+    )
     {
         path[
             path_length
-        ] =
-            '/';
+        ] = '/';
 
         path_length++;
     }
@@ -569,8 +999,7 @@ static bool append_component(
         path_length
         +
         component_length
-    ] =
-        '\0';
+    ] = '\0';
 
 
     return true;
@@ -581,20 +1010,6 @@ static bool append_component(
  * ============================================================
  * ENSURE DIRECTORY PATH
  * ============================================================
- *
- * Crea automáticamente carpetas intermedias.
- *
- * Ejemplo:
- *
- * /home/user/a/b/c
- *
- * si a/b/c no existen:
- *
- * crea:
- *
- * /home/user/a
- * /home/user/a/b
- * /home/user/a/b/c
  */
 
 static FsResult ensure_directory_absolute(
@@ -622,9 +1037,6 @@ static FsResult ensure_directory_absolute(
         absolute_path;
 
 
-    /*
-     * Saltar / inicial.
-     */
     while (
         *cursor == '/'
     )
@@ -633,7 +1045,9 @@ static FsResult ensure_directory_absolute(
     }
 
 
-    while (*cursor)
+    while (
+        *cursor
+    )
     {
         char component[
             ROOT_NAME_MAX
@@ -665,15 +1079,13 @@ static FsResult ensure_directory_absolute(
             ] =
                 *cursor;
 
-
             cursor++;
         }
 
 
         component[
             length
-        ] =
-            '\0';
+        ] = '\0';
 
 
         while (
@@ -702,16 +1114,10 @@ static FsResult ensure_directory_absolute(
             );
 
 
-        /*
-         * Ya existe.
-         */
         if (
             index >= 0
         )
         {
-            /*
-             * Pero tiene que ser carpeta.
-             */
             if (
                 nodes[index].type
                 !=
@@ -752,36 +1158,293 @@ static FsResult ensure_directory_absolute(
 
 /*
  * ============================================================
- * INITIALIZE
+ * INITIAL ROOTOS TREE
  * ============================================================
  */
 
-void filesystem_init(void)
+static FsResult create_initial_tree(void)
 {
-    root_memzero(
-        nodes,
-        sizeof(nodes)
-    );
-
-
     for (
         usize i = 0;
         i < INITIAL_NODE_COUNT;
         i++
     )
     {
-        add_node_absolute(
-            initial_nodes[i].path,
-            initial_nodes[i].type
-        );
+        FsResult result =
+            add_node_absolute(
+                initial_nodes[i].path,
+                initial_nodes[i].type
+            );
+
+
+        if (
+            result != FS_RESULT_OK
+            &&
+            result != FS_RESULT_ALREADY_EXISTS
+        )
+        {
+            return result;
+        }
     }
 
 
-    root_strlcpy(
-        current_directory,
-        ROOTOS_DEFAULT_HOME,
-        ROOT_PATH_MAX
-    );
+    return
+        FS_RESULT_OK;
+}
+
+
+/*
+ * ============================================================
+ * LOAD ROOTFS42 METADATA CACHE
+ * ============================================================
+ */
+
+static bool load_persistent_nodes(void)
+{
+    bool any_node = false;
+
+
+    for (
+        u32 i = 0;
+        i < FS_MAX_NODES;
+        i++
+    )
+    {
+        RootFsDiskNode disk_node;
+
+
+        if (
+            !rootfs_disk_read_node(
+                i,
+                &disk_node
+            )
+        )
+        {
+            filesystem_storage_error = true;
+            return false;
+        }
+
+
+        if (
+            !disk_node.used
+        )
+        {
+            continue;
+        }
+
+
+        if (
+            disk_node.path[0] != '/'
+            ||
+            disk_node.size > FS_MAX_FILE_SIZE
+        )
+        {
+            filesystem_storage_error = true;
+            return false;
+        }
+
+
+        nodes[i].used = true;
+
+        nodes[i].type =
+            disk_type_to_fs(
+                disk_node.type
+            );
+
+        nodes[i].size =
+            disk_node.size;
+
+        nodes[i].ram_content =
+            NULL;
+
+
+        if (
+            root_strlcpy(
+                nodes[i].path,
+                disk_node.path,
+                ROOT_PATH_MAX
+            )
+            >=
+            ROOT_PATH_MAX
+        )
+        {
+            filesystem_storage_error = true;
+            return false;
+        }
+
+
+        any_node = true;
+    }
+
+
+    if (
+        !any_node
+    )
+    {
+        return
+            create_initial_tree()
+            ==
+            FS_RESULT_OK;
+    }
+
+
+    int root_index =
+        find_node(
+            "/"
+        );
+
+
+    if (
+        root_index < 0
+        ||
+        nodes[root_index].type != FS_DIRECTORY
+    )
+    {
+        filesystem_storage_error = true;
+        return false;
+    }
+
+
+    /*
+     * Keep the RootOS base hierarchy forward-compatible. New base directories
+     * added by later releases are created if missing without touching user data.
+     */
+    FsResult tree_result = create_initial_tree();
+
+    if (
+        tree_result != FS_RESULT_OK
+        &&
+        tree_result != FS_RESULT_ALREADY_EXISTS
+    )
+    {
+        filesystem_storage_error = true;
+        return false;
+    }
+
+
+    return true;
+}
+
+
+/*
+ * ============================================================
+ * INITIALIZE
+ * ============================================================
+ */
+
+void filesystem_init(void)
+{
+    reset_all_nodes();
+
+
+    filesystem_storage_error =
+        false;
+
+
+    filesystem_persistent_backend =
+        rootfs_disk_ready();
+
+
+    if (
+        filesystem_persistent_backend
+    )
+    {
+        if (
+            !load_persistent_nodes()
+        )
+        {
+            /*
+             * Never try to repair/overwrite a volume automatically after an
+             * unexpected on-disk error. Fall back to a temporary RAM tree.
+             */
+            filesystem_persistent_backend =
+                false;
+
+
+            reset_all_nodes();
+
+            (void)create_initial_tree();
+        }
+    }
+    else
+    {
+        (void)create_initial_tree();
+    }
+
+
+    if (
+        find_node(
+            ROOTOS_DEFAULT_HOME
+        )
+        >=
+        0
+    )
+    {
+        root_strlcpy(
+            current_directory,
+            ROOTOS_DEFAULT_HOME,
+            ROOT_PATH_MAX
+        );
+    }
+    else
+    {
+        root_strlcpy(
+            current_directory,
+            "/",
+            ROOT_PATH_MAX
+        );
+    }
+}
+
+
+/*
+ * ============================================================
+ * BACKEND INFORMATION
+ * ============================================================
+ */
+
+bool filesystem_is_persistent(void)
+{
+    return
+        filesystem_persistent_backend;
+}
+
+
+bool filesystem_storage_faulted(void)
+{
+    return
+        filesystem_storage_error;
+}
+
+
+usize filesystem_node_count(void)
+{
+    usize count = 0;
+
+
+    for (
+        usize i = 0;
+        i < FS_MAX_NODES;
+        i++
+    )
+    {
+        if (
+            nodes[i].used
+        )
+        {
+            count++;
+        }
+    }
+
+
+    return count;
+}
+
+
+usize filesystem_free_node_count(void)
+{
+    return
+        count_free_nodes();
 }
 
 
@@ -907,16 +1570,8 @@ int filesystem_change_directory(
 
     if (
         index < 0
-    )
-    {
-        return 0;
-    }
-
-
-    if (
-        nodes[index].type
-        !=
-        FS_DIRECTORY
+        ||
+        nodes[index].type != FS_DIRECTORY
     )
     {
         return 0;
@@ -995,24 +1650,15 @@ int filesystem_list(
 
     if (
         directory_index < 0
+        ||
+        nodes[directory_index].type != FS_DIRECTORY
     )
     {
         return 0;
     }
 
 
-    if (
-        nodes[directory_index].type
-        !=
-        FS_DIRECTORY
-    )
-    {
-        return 0;
-    }
-
-
-    bool found =
-        false;
+    bool found = false;
 
 
     for (
@@ -1059,14 +1705,14 @@ int filesystem_list(
                 '\n'
             );
 
-
-            found =
-                true;
+            found = true;
         }
     }
 
 
-    if (!found)
+    if (
+        !found
+    )
     {
         terminal_print(
             "(vacio)\n"
@@ -1109,16 +1755,8 @@ int filesystem_find_directories(
     {
         if (
             !nodes[i].used
-        )
-        {
-            continue;
-        }
-
-
-        if (
-            nodes[i].type
-            !=
-            FS_DIRECTORY
+            ||
+            nodes[i].type != FS_DIRECTORY
         )
         {
             continue;
@@ -1141,7 +1779,6 @@ int filesystem_find_directories(
             terminal_putchar(
                 '\n'
             );
-
 
             count++;
         }
@@ -1205,9 +1842,6 @@ FsResult filesystem_create_directory(
     }
 
 
-    /*
-     * Crea también todos los padres.
-     */
     return
         ensure_directory_absolute(
             resolved
@@ -1297,9 +1931,6 @@ FsResult filesystem_create_file(
     }
 
 
-    /*
-     * Crear carpetas intermedias.
-     */
     FsResult parent_result =
         ensure_directory_absolute(
             parent
@@ -1355,9 +1986,6 @@ FsResult filesystem_remove(
     }
 
 
-    /*
-     * Nunca eliminar /.
-     */
     if (
         root_streq(
             resolved,
@@ -1385,10 +2013,6 @@ FsResult filesystem_remove(
     }
 
 
-    /*
-     * No podemos borrar la carpeta
-     * actual ni uno de sus padres.
-     */
     if (
         path_is_inside(
             resolved,
@@ -1401,17 +2025,24 @@ FsResult filesystem_remove(
     }
 
 
-    /*
-     * Archivo.
-     */
     if (
-        nodes[index].type
-        ==
-        FS_FILE
+        nodes[index].type == FS_FILE
     )
     {
-        nodes[index].used =
-            false;
+        if (
+            !clear_persisted_node(
+                (u32)index
+            )
+        )
+        {
+            return
+                FS_RESULT_IO_ERROR;
+        }
+
+
+        reset_node(
+            (u32)index
+        );
 
 
         return
@@ -1419,13 +2050,7 @@ FsResult filesystem_remove(
     }
 
 
-    /*
-     * Directorio.
-     *
-     * Comprobar si tiene contenido.
-     */
-    bool has_children =
-        false;
+    bool has_children = false;
 
 
     for (
@@ -1451,9 +2076,7 @@ FsResult filesystem_remove(
             )
         )
         {
-            has_children =
-                true;
-
+            has_children = true;
             break;
         }
     }
@@ -1470,10 +2093,6 @@ FsResult filesystem_remove(
     }
 
 
-    /*
-     * Recursive:
-     * borrar carpeta y descendientes.
-     */
     for (
         usize i = 0;
         i < FS_MAX_NODES;
@@ -1495,8 +2114,20 @@ FsResult filesystem_remove(
             )
         )
         {
-            nodes[i].used =
-                false;
+            if (
+                !clear_persisted_node(
+                    (u32)i
+                )
+            )
+            {
+                return
+                    FS_RESULT_IO_ERROR;
+            }
+
+
+            reset_node(
+                (u32)i
+            );
         }
     }
 
@@ -1520,7 +2151,6 @@ FsResult filesystem_copy(
     char source_path[
         ROOT_PATH_MAX
     ];
-
 
     char destination_path[
         ROOT_PATH_MAX
@@ -1576,15 +2206,8 @@ FsResult filesystem_copy(
     }
 
 
-    /*
-     * No copiar un directorio dentro
-     * de sí mismo.
-     */
-
     if (
-        nodes[source_index].type
-        ==
-        FS_DIRECTORY
+        nodes[source_index].type == FS_DIRECTORY
         &&
         path_is_inside(
             source_path,
@@ -1596,10 +2219,6 @@ FsResult filesystem_copy(
             FS_RESULT_INVALID_PATH;
     }
 
-
-    /*
-     * Crear carpeta padre del destino.
-     */
 
     char parent[
         ROOT_PATH_MAX
@@ -1635,12 +2254,7 @@ FsResult filesystem_copy(
     }
 
 
-    /*
-     * Contar nodos necesarios.
-     */
-
-    usize required =
-        0;
+    usize required = 0;
 
 
     for (
@@ -1679,10 +2293,6 @@ FsResult filesystem_copy(
             source_path
         );
 
-
-    /*
-     * Validar rutas antes de empezar.
-     */
 
     for (
         usize i = 0;
@@ -1726,10 +2336,6 @@ FsResult filesystem_copy(
         }
     }
 
-
-    /*
-     * Copiar nodos.
-     */
 
     for (
         usize i = 0;
@@ -1781,10 +2387,43 @@ FsResult filesystem_copy(
         );
 
 
+        FsType source_type =
+            nodes[i].type;
+
+        usize source_size =
+            nodes[i].size;
+
+
+        if (
+            source_type == FS_FILE
+            &&
+            source_size > 0
+        )
+        {
+            usize read_size = 0;
+
+
+            if (
+                !backend_read_file(
+                    (u32)i,
+                    fs_copy_buffer,
+                    FS_MAX_FILE_SIZE,
+                    &read_size
+                )
+                ||
+                read_size != source_size
+            )
+            {
+                return
+                    FS_RESULT_IO_ERROR;
+            }
+        }
+
+
         FsResult result =
             add_node_absolute(
                 target,
-                nodes[i].type
+                source_type
             );
 
 
@@ -1798,15 +2437,8 @@ FsResult filesystem_copy(
         }
 
 
-        /*
-         * Si es archivo, copiar también
-         * tamaño y contenido.
-         */
-
         if (
-            nodes[i].type
-            ==
-            FS_FILE
+            source_type == FS_FILE
         )
         {
             int target_index =
@@ -1820,30 +2452,21 @@ FsResult filesystem_copy(
             )
             {
                 return
-                    FS_RESULT_NOT_FOUND;
+                    FS_RESULT_IO_ERROR;
             }
-
-
-            nodes[target_index].size =
-                nodes[i].size;
 
 
             if (
-                nodes[i].size > 0
+                !backend_write_file(
+                    (u32)target_index,
+                    fs_copy_buffer,
+                    source_size
+                )
             )
             {
-                root_memcpy(
-                    nodes[target_index].content,
-                    nodes[i].content,
-                    nodes[i].size
-                );
+                return
+                    FS_RESULT_IO_ERROR;
             }
-
-
-            nodes[target_index].content[
-                nodes[target_index].size
-            ] =
-                '\0';
         }
     }
 
@@ -1867,7 +2490,6 @@ FsResult filesystem_move(
     char source_path[
         ROOT_PATH_MAX
     ];
-
 
     char destination_path[
         ROOT_PATH_MAX
@@ -1936,9 +2558,7 @@ FsResult filesystem_move(
 
 
     if (
-        nodes[source_index].type
-            ==
-            FS_DIRECTORY
+        nodes[source_index].type == FS_DIRECTORY
         &&
         path_is_inside(
             source_path,
@@ -1951,9 +2571,6 @@ FsResult filesystem_move(
     }
 
 
-    /*
-     * Crear padres de destino.
-     */
     char parent[
         ROOT_PATH_MAX
     ];
@@ -1994,9 +2611,6 @@ FsResult filesystem_move(
         );
 
 
-    /*
-     * Validar todas las nuevas rutas.
-     */
     for (
         usize i = 0;
         i < FS_MAX_NODES;
@@ -2040,10 +2654,6 @@ FsResult filesystem_move(
     }
 
 
-    /*
-     * Si estamos dentro del directorio movido,
-     * actualizar también cwd.
-     */
     bool update_current =
         path_is_inside(
             source_path,
@@ -2056,7 +2666,9 @@ FsResult filesystem_move(
     ];
 
 
-    if (update_current)
+    if (
+        update_current
+    )
     {
         const char* current_suffix =
             current_directory
@@ -2085,9 +2697,6 @@ FsResult filesystem_move(
     }
 
 
-    /*
-     * Renombrar fuente y descendientes.
-     */
     for (
         usize i = 0;
         i < FS_MAX_NODES;
@@ -2113,9 +2722,20 @@ FsResult filesystem_move(
             source_length;
 
 
+        char old_path[
+            ROOT_PATH_MAX
+        ];
+
         char target[
             ROOT_PATH_MAX
         ];
+
+
+        root_strlcpy(
+            old_path,
+            nodes[i].path,
+            ROOT_PATH_MAX
+        );
 
 
         root_strlcpy(
@@ -2143,10 +2763,29 @@ FsResult filesystem_move(
             target,
             ROOT_PATH_MAX
         );
+
+
+        if (
+            !persist_node(
+                (u32)i
+            )
+        )
+        {
+            root_strlcpy(
+                nodes[i].path,
+                old_path,
+                ROOT_PATH_MAX
+            );
+
+            return
+                FS_RESULT_IO_ERROR;
+        }
     }
 
 
-    if (update_current)
+    if (
+        update_current
+    )
     {
         root_strlcpy(
             current_directory,
@@ -2159,6 +2798,7 @@ FsResult filesystem_move(
     return
         FS_RESULT_OK;
 }
+
 
 /*
  * ============================================================
@@ -2173,6 +2813,14 @@ FsResult filesystem_read_file(
     usize* result_size
 )
 {
+    if (
+        result_size != NULL
+    )
+    {
+        *result_size = 0;
+    }
+
+
     if (
         path == NULL
         ||
@@ -2242,30 +2890,31 @@ FsResult filesystem_read_file(
     }
 
 
+    usize size = 0;
+
+
     if (
-        nodes[index].size > 0
+        !backend_read_file(
+            (u32)index,
+            output,
+            output_size - 1,
+            &size
+        )
     )
     {
-        root_memcpy(
-            output,
-            nodes[index].content,
-            nodes[index].size
-        );
+        return
+            FS_RESULT_IO_ERROR;
     }
 
 
-    output[
-        nodes[index].size
-    ] =
-        '\0';
+    output[size] = '\0';
 
 
     if (
         result_size != NULL
     )
     {
-        *result_size =
-            nodes[index].size;
+        *result_size = size;
     }
 
 
@@ -2358,25 +3007,20 @@ FsResult filesystem_write_file(
 
 
     if (
-        size > 0
-    )
-    {
-        root_memcpy(
-            nodes[index].content,
+        !backend_write_file(
+            (u32)index,
             data,
             size
-        );
+        )
+    )
+    {
+        return
+            filesystem_persistent_backend
+            ?
+            FS_RESULT_IO_ERROR
+            :
+            FS_RESULT_NO_SPACE;
     }
-
-
-    nodes[index].size =
-        size;
-
-
-    nodes[index].content[
-        size
-    ] =
-        '\0';
 
 
     return
@@ -2469,31 +3113,110 @@ FsResult filesystem_append_file(
     }
 
 
+    usize old_size = 0;
+
+
+    if (
+        !backend_read_file(
+            (u32)index,
+            fs_io_buffer,
+            FS_MAX_FILE_SIZE,
+            &old_size
+        )
+    )
+    {
+        return
+            FS_RESULT_IO_ERROR;
+    }
+
+
     if (
         size > 0
     )
     {
         root_memcpy(
-            nodes[index].content
-            +
-            nodes[index].size,
-
+            fs_io_buffer + old_size,
             data,
             size
         );
     }
 
 
-    nodes[index].size +=
+    usize new_size =
+        old_size
+        +
         size;
 
 
-    nodes[index].content[
-        nodes[index].size
-    ] =
-        '\0';
+    if (
+        !backend_write_file(
+            (u32)index,
+            fs_io_buffer,
+            new_size
+        )
+    )
+    {
+        return
+            filesystem_persistent_backend
+            ?
+            FS_RESULT_IO_ERROR
+            :
+            FS_RESULT_NO_SPACE;
+    }
 
 
     return
         FS_RESULT_OK;
+}
+
+
+/*
+ * ============================================================
+ * FILE SIZE
+ * ============================================================
+ */
+
+bool filesystem_file_size(
+    const char* path,
+    usize* size
+)
+{
+    if (
+        path == NULL
+        ||
+        size == NULL
+    )
+    {
+        return false;
+    }
+
+    *size = 0;
+
+    char resolved[ROOT_PATH_MAX];
+
+    if (
+        !root_path_resolve(
+            current_directory,
+            path,
+            resolved,
+            ROOT_PATH_MAX
+        )
+    )
+    {
+        return false;
+    }
+
+    int index = find_node(resolved);
+
+    if (
+        index < 0
+        ||
+        nodes[index].type != FS_FILE
+    )
+    {
+        return false;
+    }
+
+    *size = nodes[index].size;
+    return true;
 }

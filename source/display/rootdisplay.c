@@ -733,29 +733,150 @@ static void framebuffer_copy_forward(
 )
 {
     /*
-     * The framebuffer is normally 32-bit aligned. Copy four bytes
-     * per iteration whenever alignment allows it. This is materially
-     * faster than the previous byte-at-a-time scroll path.
+     * Hot framebuffer path. Copy cache-line sized chunks with explicit
+     * 32-bit stores instead of byte-at-a-time MMIO writes. The loop is
+     * manually unrolled so freestanding -O2 does not need libc or SIMD.
      */
-    if (
-        ((((usize)destination) | ((usize)source)) & 3u) == 0
-    )
+    if (((((usize)destination) | ((usize)source)) & 3u) == 0)
     {
         volatile u32* dst32 = (volatile u32*)destination;
         const volatile u32* src32 = (const volatile u32*)source;
         usize words = bytes / 4u;
 
-        for (usize i = 0; i < words; i++)
-            dst32[i] = src32[i];
+        while (words >= 8u)
+        {
+            dst32[0] = src32[0];
+            dst32[1] = src32[1];
+            dst32[2] = src32[2];
+            dst32[3] = src32[3];
+            dst32[4] = src32[4];
+            dst32[5] = src32[5];
+            dst32[6] = src32[6];
+            dst32[7] = src32[7];
+            dst32 += 8;
+            src32 += 8;
+            words -= 8u;
+        }
 
-        usize copied = words * 4u;
+        while (words != 0u)
+        {
+            *dst32++ = *src32++;
+            words--;
+        }
+
+        usize copied = (bytes / 4u) * 4u;
         destination += copied;
         source += copied;
         bytes -= copied;
     }
 
-    for (usize i = 0; i < bytes; i++)
-        destination[i] = source[i];
+    while (bytes != 0u)
+    {
+        *destination++ = *source++;
+        bytes--;
+    }
+}
+
+static void framebuffer_copy_backward(
+    volatile u8* destination,
+    const volatile u8* source,
+    usize bytes
+)
+{
+    if (bytes == 0u)
+        return;
+
+    if (((((usize)destination) | ((usize)source) | bytes) & 3u) == 0)
+    {
+        volatile u32* dst32 =
+            (volatile u32*)(destination + bytes);
+        const volatile u32* src32 =
+            (const volatile u32*)(source + bytes);
+        usize words = bytes / 4u;
+
+        while (words >= 8u)
+        {
+            dst32[-1] = src32[-1];
+            dst32[-2] = src32[-2];
+            dst32[-3] = src32[-3];
+            dst32[-4] = src32[-4];
+            dst32[-5] = src32[-5];
+            dst32[-6] = src32[-6];
+            dst32[-7] = src32[-7];
+            dst32[-8] = src32[-8];
+            dst32 -= 8;
+            src32 -= 8;
+            words -= 8u;
+        }
+
+        while (words != 0u)
+        {
+            --dst32;
+            --src32;
+            *dst32 = *src32;
+            words--;
+        }
+
+        return;
+    }
+
+    while (bytes != 0u)
+    {
+        bytes--;
+        destination[bytes] = source[bytes];
+    }
+}
+
+static void framebuffer_fill_rows(
+    u32 start_y,
+    u32 row_count,
+    u32 packed
+)
+{
+    if (row_count == 0u || start_y >= display_height)
+        return;
+
+    if (row_count > display_height - start_y)
+        row_count = display_height - start_y;
+
+    if (display_bytes_per_pixel == 4u)
+    {
+        for (u32 row = 0; row < row_count; row++)
+        {
+            volatile u32* dst =
+                (volatile u32*)(framebuffer +
+                    (usize)(start_y + row) * display_pitch);
+            u32 remaining = display_width;
+
+            while (remaining >= 8u)
+            {
+                dst[0] = packed;
+                dst[1] = packed;
+                dst[2] = packed;
+                dst[3] = packed;
+                dst[4] = packed;
+                dst[5] = packed;
+                dst[6] = packed;
+                dst[7] = packed;
+                dst += 8;
+                remaining -= 8u;
+            }
+
+            while (remaining != 0u)
+            {
+                *dst++ = packed;
+                remaining--;
+            }
+        }
+
+        return;
+    }
+
+    for (u32 y = start_y; y < start_y + row_count; y++)
+    {
+        for (u32 x = 0; x < display_width; x++)
+            raw_put_packed_pixel(x, y, packed);
+    }
 }
 
 void rootdisplay_scroll_up(
@@ -794,6 +915,92 @@ void rootdisplay_scroll_up(
     {
         for (u32 x = 0; x < display_width; x++)
             raw_put_packed_pixel(x, y, packed_fill);
+    }
+
+    rootdisplay_end_update();
+}
+
+
+void rootdisplay_shift_vertical(
+    u32 region_y,
+    u32 region_height,
+    i32 pixel_delta,
+    u32 fill_color
+)
+{
+    if (
+        !display_available ||
+        region_height == 0u ||
+        pixel_delta == 0 ||
+        region_y >= display_height
+    )
+    {
+        return;
+    }
+
+    if (region_height > display_height - region_y)
+        region_height = display_height - region_y;
+
+    u32 amount =
+        (u32)(pixel_delta < 0 ? -pixel_delta : pixel_delta);
+
+    if (amount >= region_height)
+    {
+        rootdisplay_fill_rect(
+            0,
+            region_y,
+            display_width,
+            region_height,
+            fill_color
+        );
+        return;
+    }
+
+    rootdisplay_begin_update();
+
+    usize pitch = (usize)display_pitch;
+    usize bytes_to_move =
+        (usize)(region_height - amount) * pitch;
+
+    if (pixel_delta < 0)
+    {
+        /* Content moves upward. */
+        volatile u8* destination =
+            framebuffer + (usize)region_y * pitch;
+        const volatile u8* source =
+            framebuffer + (usize)(region_y + amount) * pitch;
+
+        framebuffer_copy_forward(
+            destination,
+            source,
+            bytes_to_move
+        );
+
+        framebuffer_fill_rows(
+            region_y + region_height - amount,
+            amount,
+            pack_physical_color(fill_color)
+        );
+    }
+    else
+    {
+        /* Content moves downward. Overlap requires a backwards copy. */
+        volatile u8* destination =
+            framebuffer + (usize)(region_y + amount) * pitch;
+        const volatile u8* source =
+            framebuffer + (usize)region_y * pitch;
+
+        framebuffer_copy_backward(
+            destination,
+            source,
+            bytes_to_move
+        );
+
+        framebuffer_fill_rows(
+            region_y,
+            amount,
+            pack_physical_color(fill_color)
+        );
     }
 
     rootdisplay_end_update();

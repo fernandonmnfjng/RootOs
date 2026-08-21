@@ -8,7 +8,7 @@
 #include "memory.h"
 #include "time.h"
 
-#define ROOT_INPUT_QUEUE_SIZE 256
+#define ROOT_INPUT_QUEUE_SIZE 128
 
 
 #define MOUSE_MASK_LEFT   0x01
@@ -39,6 +39,7 @@ static i32 mouse_max_x = 1023;
 static i32 mouse_max_y = 767;
 
 static u8 mouse_buttons = 0;
+static bool mouse_visual_dirty = false;
 
 
 static i32 press_x[4];
@@ -66,91 +67,66 @@ static i32 last_click_y[4];
  * ============================================================
  */
 
-static bool queue_motion_type(
-    RootInputEventType type
-)
-{
-    return
-        type == ROOT_INPUT_MOUSE_MOVE
-        ||
-        type == ROOT_INPUT_MOUSE_DRAG;
-}
-
-
 static void queue_push(
     const RootInputEvent* event
 )
 {
-    if (event == NULL)
-    {
-        return;
-    }
-
-
     /*
-     * Mouse motion can arrive much faster than applications consume
-     * events. Keeping every intermediate coordinate only fills the
-     * queue and can delay/drop keyboard events. Consecutive motion
-     * events are therefore coalesced into the newest position.
+     * Coalesce high-frequency events before they reach the shell/editor.
+     * This is especially important for wheel bursts and mouse movement:
+     * one visual update should represent the newest state, not every PS/2
+     * packet individually.
      */
-    if (
-        queue_head != queue_tail
-        &&
-        queue_motion_type(event->type)
-    )
+    if (queue_head != queue_tail)
     {
-        u32 last =
-            (
-                queue_head
-                +
-                ROOT_INPUT_QUEUE_SIZE
-                -
-                1
-            )
-            %
+        u32 previous =
+            (queue_head + ROOT_INPUT_QUEUE_SIZE - 1u) %
             ROOT_INPUT_QUEUE_SIZE;
 
+        RootInputEvent* last = &queue[previous];
 
         if (
-            queue[last].type == event->type
-            &&
-            queue[last].mouse_buttons == event->mouse_buttons
+            event->type == ROOT_INPUT_MOUSE_WHEEL &&
+            last->type == ROOT_INPUT_MOUSE_WHEEL
         )
         {
-            queue[last].timestamp_ms = event->timestamp_ms;
-            queue[last].mouse_x = event->mouse_x;
-            queue[last].mouse_y = event->mouse_y;
-            queue[last].mouse_dx += event->mouse_dx;
-            queue[last].mouse_dy += event->mouse_dy;
-            queue[last].button = event->button;
+            i32 combined = last->mouse_wheel + event->mouse_wheel;
+
+            if (combined > 32) combined = 32;
+            if (combined < -32) combined = -32;
+
+            last->mouse_wheel = combined;
+            last->mouse_x = event->mouse_x;
+            last->mouse_y = event->mouse_y;
+            last->mouse_buttons = event->mouse_buttons;
+            last->timestamp_ms = event->timestamp_ms;
+            return;
+        }
+
+        if (
+            (event->type == ROOT_INPUT_MOUSE_MOVE ||
+             event->type == ROOT_INPUT_MOUSE_DRAG) &&
+            last->type == event->type &&
+            last->mouse_buttons == event->mouse_buttons
+        )
+        {
+            last->mouse_dx += event->mouse_dx;
+            last->mouse_dy += event->mouse_dy;
+            last->mouse_x = event->mouse_x;
+            last->mouse_y = event->mouse_y;
+            last->timestamp_ms = event->timestamp_ms;
             return;
         }
     }
 
-
     u32 next =
-        (
-            queue_head + 1
-        )
-        %
-        ROOT_INPUT_QUEUE_SIZE;
+        (queue_head + 1u) % ROOT_INPUT_QUEUE_SIZE;
 
-
-    /*
-     * Fixed-size queue: never grow RAM indefinitely. If it becomes
-     * full, discard the oldest queued event. Motion coalescing makes
-     * this considerably less likely during normal use.
-     */
     if (next == queue_tail)
     {
         queue_tail =
-            (
-                queue_tail + 1
-            )
-            %
-            ROOT_INPUT_QUEUE_SIZE;
+            (queue_tail + 1u) % ROOT_INPUT_QUEUE_SIZE;
     }
-
 
     queue[queue_head] = *event;
     queue_head = next;
@@ -645,6 +621,37 @@ static void process_mouse(
     }
 
 
+    /*
+     * ========================================================
+     * WHEEL
+     * ========================================================
+     */
+
+    if (packet.wheel != 0)
+    {
+        RootInputEvent wheel =
+            blank_event(
+                ROOT_INPUT_MOUSE_WHEEL
+            );
+
+        wheel.mouse_x =
+            mouse_x;
+
+        wheel.mouse_y =
+            mouse_y;
+
+        wheel.mouse_wheel =
+            packet.wheel;
+
+        wheel.mouse_buttons =
+            mouse_buttons;
+
+        queue_push(
+            &wheel
+        );
+    }
+
+
     u8 old_buttons =
         mouse_buttons;
 
@@ -726,15 +733,8 @@ static void process_mouse(
          * No depende de la shell ni de RootEdit.
          */
 
-        if (
-            rootdisplay_ready()
-        )
-        {
-            rootdisplay_cursor_move(
-                mouse_x,
-                mouse_y
-            );
-        }
+        /* Defer the software cursor redraw until the PS/2 FIFO is drained. */
+        mouse_visual_dirty = true;
 
 
         RootInputEvent move =
@@ -985,6 +985,9 @@ void rootinput_init(void)
     mouse_buttons =
         0;
 
+    mouse_visual_dirty =
+        false;
+
 
     /*
      * ========================================================
@@ -1092,6 +1095,20 @@ void rootinput_poll(void)
                 data
             );
         }
+    }
+
+    if (
+        mouse_visual_dirty &&
+        rootdisplay_ready()
+    )
+    {
+        rootdisplay_cursor_move(
+            mouse_x,
+            mouse_y
+        );
+
+        mouse_visual_dirty =
+            false;
     }
 }
 
