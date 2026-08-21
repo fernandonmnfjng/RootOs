@@ -1,4 +1,4 @@
-# Proyect Root OS
+# Proyect Root OS V0.47-5-1 UNESTABLE
 
 I am writing this at midnight, but you can already run it in
 --QEMU--
