@@ -100,6 +100,9 @@ rather than another 0.47.6 repair suffix.
 ## Build
 
 ```bash
+make check
+make run
+# if not working
 make clear
 make
 make check
